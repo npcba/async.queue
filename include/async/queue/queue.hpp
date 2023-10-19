@@ -13,13 +13,25 @@
 #include <boost/asio/error.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/detail/bind_handler.hpp> // "preserved_binder.h"
 #include <boost/core/noncopyable.hpp>
+
+// Библиотека использует недокументированный boost::asio::detail::binder и move_binder
+// Они широко используется во внутренностях asio, и, вероятно, его поддержка не иссякнет.
+// Предпочтительнее использовать его, т.к. его поддерживают и могут добавить для него новые traits.
+// Но, на случай, если он пропадет в будущих версиях boost,
+// есть самописный аналог в ./preserved_binder.h, перед его использованием проверьте, что для него
+// специализированы все нужные и современные traits, такие как boost::asio::associated_executor и т.д.
+#include <boost/asio/detail/bind_handler.hpp>
 
 
 namespace ba {
 namespace async {
 
+/// Асинхронная очередь с ограничением длины (минимум 0).
+/**
+ * Потокобезопасная.
+ * Вызывает хендлер завершения после постановки или получения элемента.
+ */
 template <
       typename T
     , typename Executor = boost::asio::executor
@@ -32,6 +44,11 @@ public:
     using value_type = typename container_type::value_type;
     using executor_type = Executor;
 
+    /// Создает очередь элементов типа T.
+    /**
+     * Исполняется на Executor ex.
+     * Огрничена размером limit
+     */
     explicit Queue(const executor_type& ex, std::size_t limit)
         : m_ex{ ex }
         , m_limit{ limit }
@@ -39,6 +56,11 @@ public:
         checkInvariant();
     }
 
+    /// Создает очередь элементов типа T.
+    /**
+     * Аналогично с первым конструктором, но достает Executor из context,
+     * например, из boost::asio::io_context.
+     */
     template <typename ExecutionContext>
     explicit Queue(
           ExecutionContext& context
@@ -51,30 +73,38 @@ public:
     {
     }
 
+    /// Копироваться не умеет.
     Queue(const Queue&) = delete;
     Queue& operator=(const Queue&) = delete;
 
+    /// Перемещаться умеет
     Queue(Queue&& other)
         : Queue(std::move(other), LockGuard{ other })
     {
     }
 
+    /// Перемещаться умеет
     Queue& operator=(Queue&& other)
     {
+        // Хоть и трудно себе представить deadlock в данном случае, на всякий 2 мьютекса лочатся атомарно.
         std::unique_lock<std::recursive_mutex> lkThis{ m_mutex, std::defer_lock };
         std::unique_lock<std::recursive_mutex> lkOther{ other.m_mutex, std::defer_lock };
         std::lock(lkThis, lkOther);
 
         other.checkInvariant();
 
+        // Чистит себя.
         reset();
-        m_ex = other.m_ex; // оставляем копию
+        // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
+        m_ex = other.m_ex;
         m_limit = other.m_limit;
         m_queue = std::move(other.m_queue);
         m_pendingPush = std::move(other.m_pendingPush);
         m_pendingPop = std::move(other.m_pendingPop);
         checkInvariant();
 
+        // other нужно очистить на случай,
+        // если параметризовнный тип Container после перемещения оставляет в себе элементы.
         other.reset();
 
         return *this;
@@ -82,9 +112,23 @@ public:
 
     ~Queue()
     {
+        // Отменяются все ждущие операции.
         cancel();
     }
 
+    /// Асинхронно вставляет элемент и по завершению исполняет хендлер,
+    /// порожденный от token
+    /**
+     * @param val элемент
+     * @param token должен порождать хендлер или быть хендлером с сигнатурой:
+     * @code void handler(
+     *     const boost::system::error_code& error // результат операции.
+     * ); @endcode
+     * :)
+     * Если очередь заполнена, вставка элемента и вызов handler произойдет
+     * после очередного вызова @ref asyncPop.
+     * При отмене ожидаемой операции error == boost::asio::error::operation_aborted.
+     */
     template <typename U, typename PushToken>
     auto asyncPush(U&& val, PushToken&& token)
     {
@@ -151,6 +195,21 @@ public:
         return init.result.get();
     }
 
+    /// Асинхронно извлекает элемент и по завершению исполняет хендлер,
+    /// порожденный от token
+    /**
+     * @param val элемент
+     * @param token должен порождать хендлер или быть хендлером с сигнатурой:
+     * @code void handler(
+     *       const boost::system::error_code& error // результат операции
+     *     , boost::optional<T>&& value // извлеченное значение
+     * ); @endcode
+     * :)
+     * Если очередь пуста, извлечение элемента и вызов handler произойдет
+     * после очередного вызова @ref asyncPush.
+     * При отмене ожидаемой операции error == boost::asio::error::operation_aborted и
+     * value == boost::none
+     */
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
     {
@@ -244,6 +303,7 @@ public:
         return m_limit;
     }
 
+    /// Отменяет одну ожидающую операцию вставки и возвращяет их количество (0 или 1).
     std::size_t cancelOnePush()
     {
         LockGuard lkGuard{ *this };
@@ -257,6 +317,7 @@ public:
         return 1;
     }
 
+    /// Отменяет все ожидающие операции вставки и возвращяет их количество.
     std::size_t cancelPush()
     {
         LockGuard lkGuard{ *this };
@@ -268,6 +329,7 @@ public:
         return n;
     }
 
+    /// Отменяет одну ожидающую операцию извлечения и возвращяет их количество (0 или 1).
     std::size_t cancelOnePop()
     {
         LockGuard lkGuard{ *this };
@@ -281,6 +343,7 @@ public:
         return 1;
     }
 
+    /// Отменяет все ожидающие операции извлечения и возвращяет их количество.
     std::size_t cancelPop()
     {
         LockGuard lkGuard{ *this };
@@ -292,24 +355,32 @@ public:
         return n;
     }
 
+    /// Отменяет все ожидающие операции вставки и извлечения и возвращяет их количество.
     std::size_t cancel()
     {
         LockGuard lkGuard{ *this };
 
-        std::size_t n = cancelPush(); // сначала отменяем ждущие push
-        return n + cancelPop(); // потом pop, пусть будет определен такой порядок для пользователя
+        // Сначала отменяются ждущие push.
+        std::size_t n = cancelPush();
+        // Потом pop, пусть будет определен такой порядок для пользователя.
+        return n + cancelPop();
     }
 
+    /// Очищает очередь. Отменяет все ожидающие операции и возвращяет их количество.
     std::size_t reset()
     {
         LockGuard lkGuard{ *this };
 
+        // У std::queue не clear :)
         container_type empty;
-        std::swap(m_queue, empty); // clear
+        std::swap(m_queue, empty);
+
         return cancel();
     }
 
 private:
+    // Обертка над std::unique_lock.
+    // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
     class LockGuard
         : boost::noncopyable
     {
@@ -338,7 +409,7 @@ private:
     };
 
     Queue(Queue&& other, const LockGuard&)
-        : m_ex{ other.m_ex } // оставляем копию
+        : m_ex{ other.m_ex } // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
         , m_limit{ other.m_limit }
         , m_queue{ std::move(other.m_queue) }
         , m_pendingPush{ std::move(other.m_pendingPush) }
@@ -364,6 +435,7 @@ private:
     {
         auto handlerCopy = std::forward<PopHandler>(handler);
 
+        // move_binder2 вместо обычного, чтобы не копировать лишний раз val
         boost::asio::detail::move_binder2<
               decltype(handlerCopy)
             , boost::system::error_code
@@ -386,19 +458,20 @@ private:
     }
 
 private:
+    mutable std::recursive_mutex m_mutex;
     executor_type m_ex;
     std::size_t m_limit = 0;
     container_type m_queue;
 
+    // Здесь хранятся ожидающие операции вставки, когда очередь переолнена.
     std::queue<
         std::function<void(Queue&, const boost::system::error_code&)>
         > m_pendingPush;
 
+    // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
     std::queue<
         std::function<void(Queue&, const boost::system::error_code&, boost::optional<value_type>&&)>
         > m_pendingPop;
-
-    mutable std::recursive_mutex m_mutex;
 };
 
 } // namespace async

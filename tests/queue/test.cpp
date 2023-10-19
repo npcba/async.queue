@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <thread>
+#include <atomic>
 
 #include <boost/test/included/unit_test.hpp>
 
@@ -186,7 +187,7 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
     BOOST_CHECK_EQUAL(0, q.cancel());
 }
 
-/*BOOST_AUTO_TEST_CASE(manyConsumerTest)
+BOOST_AUTO_TEST_CASE(manyConsumerTest)
 {
     boost::asio::io_context ioc;
     ba::async::Queue<std::size_t> q{ ioc, 15 };
@@ -196,7 +197,8 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
             BOOST_CHECK_NO_THROW(q.asyncPush(i, yield));
     });
 
-    std::size_t sum = 0;
+    std::atomic_size_t sum;
+    sum = 0;
 
     for (int j = 0; j < 10; ++j)
     {
@@ -211,7 +213,7 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
 
     BOOST_CHECK(q.empty());
     BOOST_CHECK_EQUAL(0, q.cancel());
-}*/
+}
 
 BOOST_AUTO_TEST_CASE(moveValueTest)
 {

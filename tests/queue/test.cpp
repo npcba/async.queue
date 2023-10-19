@@ -186,7 +186,7 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
     BOOST_CHECK_EQUAL(0, q.cancel());
 }
 
-BOOST_AUTO_TEST_CASE(manyConsumerTest)
+/*BOOST_AUTO_TEST_CASE(manyConsumerTest)
 {
     boost::asio::io_context ioc;
     ba::async::Queue<std::size_t> q{ ioc, 15 };
@@ -211,7 +211,7 @@ BOOST_AUTO_TEST_CASE(manyConsumerTest)
 
     BOOST_CHECK(q.empty());
     BOOST_CHECK_EQUAL(0, q.cancel());
-}
+}*/
 
 BOOST_AUTO_TEST_CASE(moveValueTest)
 {

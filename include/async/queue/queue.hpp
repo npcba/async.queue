@@ -19,7 +19,7 @@
 // Они широко используется во внутренностях asio, и, вероятно, его поддержка не иссякнет.
 // Предпочтительнее использовать его, т.к. его поддерживают и могут добавить для него новые traits.
 // Но, на случай, если он пропадет в будущих версиях boost,
-// есть самописный аналог в ./preserved_binder.h, перед его использованием проверьте, что для него
+// есть самописный аналог в ./preserved_binder.hpp, перед его использованием проверьте, что для него
 // специализированы все нужные и современные traits, такие как boost::asio::associated_executor и т.д.
 #include <boost/asio/detail/bind_handler.hpp>
 
@@ -232,6 +232,7 @@ public:
         {
             m_pendingPush.front()(*this, boost::system::error_code{});
             m_pendingPush.pop();
+            assert(1 == m_queue.size());
 
             invokePopHandler(
                   init.completion_handler

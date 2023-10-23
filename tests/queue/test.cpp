@@ -1,4 +1,4 @@
-#define BOOST_TEST_MODULE Libasync
+#define BOOST_TEST_MODULE LibAsync
 
 #include <async/queue/queue.hpp>
 

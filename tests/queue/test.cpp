@@ -2,14 +2,13 @@
 
 #include <async/queue/queue.hpp>
 
-#include <iostream>
 #include <thread>
 #include <atomic>
+#include <vector>
 
 #include <boost/test/included/unit_test.hpp>
-
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_future.hpp>
+
 #define BOOST_COROUTINES_NO_DEPRECATION_WARNING
 #include <boost/asio/spawn.hpp>
 
@@ -33,10 +32,13 @@ private:
     std::vector<std::thread> m_threads;
 };
 
+
 BOOST_AUTO_TEST_CASE(strandTest)
 {
     boost::asio::io_context ioc;
+    // Новый strand.
     boost::asio::strand<boost::asio::io_context::executor_type> s1{ ioc.get_executor() };
+    // Deprecated strand.
     boost::asio::io_context::strand s2{ ioc };
 
     ba::async::Queue<int> q0{ ioc, 10 };
@@ -92,10 +94,12 @@ BOOST_AUTO_TEST_CASE(strandTest)
     ioc.restart();
     ThreadPool{ ioc, 10 }.join();
 
+    // Ничего не осталось в очередях.
     BOOST_CHECK(q0.empty());
     BOOST_CHECK(q1.empty());
     BOOST_CHECK(q2.empty());
 
+    // Не осталось никого в ожидании.
     BOOST_CHECK_EQUAL(0, q0.cancel());
     BOOST_CHECK_EQUAL(0, q1.cancel());
     BOOST_CHECK_EQUAL(0, q2.cancel());
@@ -141,19 +145,26 @@ BOOST_AUTO_TEST_CASE(contentTest)
     boost::asio::io_context ioc;
     ba::async::Queue<std::size_t> q{ ioc, 10 };
 
+    // Одна корутина толкает.
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
+        // Вставляем от 1 до 10 000.
         for (std::size_t i = 1; i <= 10'000; ++i)
             q.asyncPush(i, yield);
     });
 
+    // Другая тянет
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         std::size_t sum = 0;
+        // Суммируем все извлеченное.
         for (std::size_t i = 1; i <= 10'000; ++i)
             BOOST_CHECK_NO_THROW(sum += q.asyncPop(yield).value());
 
+        // Проверяем полученную сумму.
         BOOST_CHECK_EQUAL(50005000, sum);
     });
 
+    // Синхронизации между корутинами намерено нет.
+    // 10 потоков в пуле.
     ThreadPool{ ioc, 10 }.join();
 
     BOOST_CHECK(q.empty());
@@ -165,6 +176,7 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
     boost::asio::io_context ioc;
     ba::async::Queue<std::size_t> q{ioc, 15 };
 
+    // 10 параллельных вставлятелей.
     for (int j = 0; j < 10; ++j)
     {
         boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
@@ -173,6 +185,7 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
         });
     }
 
+    // 1 извлекатель.
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         std::size_t sum = 0;
         for (std::size_t i = 1; i <= 10'000; ++i)
@@ -192,6 +205,7 @@ BOOST_AUTO_TEST_CASE(manyConsumerTest)
     boost::asio::io_context ioc;
     ba::async::Queue<std::size_t> q{ ioc, 15 };
 
+    // 1 вставлятель.
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         for (std::size_t i = 1; i <= 10'000; ++i)
             BOOST_CHECK_NO_THROW(q.asyncPush(i, yield));
@@ -200,6 +214,7 @@ BOOST_AUTO_TEST_CASE(manyConsumerTest)
     std::atomic_size_t sum;
     sum = 0;
 
+    // 10 параллельных извлекателей.
     for (int j = 0; j < 10; ++j)
     {
         boost::asio::spawn(ioc, [&q, &sum](boost::asio::yield_context yield) {
@@ -217,6 +232,11 @@ BOOST_AUTO_TEST_CASE(manyConsumerTest)
 
 BOOST_AUTO_TEST_CASE(moveValueTest)
 {
+    // Проверка, что элементы очереди всегда перемещается, но не копируются.
+    // Compile-time гарантий дать не получится, т.к. std::function, на базе которой
+    // реализованы отложенные операции, требует CopyConstructible.
+    // Элементы связываются лямбдой и оборачиваются в std::function.
+
     struct Movable
     {
         Movable() = default;
@@ -248,12 +268,18 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
 
 BOOST_AUTO_TEST_CASE(moveQueueTest)
 {
+    // Проверка, что move-конструктор и assignment корректны.
     boost::asio::io_context ioc;
+
+    // Исходная очередь с лимитом 2
     ba::async::Queue<int> q1{ ioc, 2 };
+
+    // Присвивать ее будем очереди с другим лимитом, для проверки, что лимит стал как в исходной.
     ba::async::Queue<int> q2{ ioc, 10 };
     std::vector<ba::async::Queue<int>> q3;
-   
 
+    // 5 раз вставляем, 2 извлекаем, чтобы очередь была заполнена и одна вставка осталась в ожидании.
+    
     q1.asyncPush(1, [](boost::system::error_code) {});
     q1.asyncPush(2, [](boost::system::error_code) {});
     q1.asyncPush(3, [](boost::system::error_code) {});
@@ -265,13 +291,19 @@ BOOST_AUTO_TEST_CASE(moveQueueTest)
     });
 
     q1.asyncPop([&q2, &q3](boost::system::error_code, ba::async::optional<int>) mutable {
+        // Делаем именно в хендлере, что бы поймать состояние полной очереди и ожидающей операции вставки.
+        // После ThreadPool::join нельзя, он зависнет на ожидающей операции вставки.
+
         q3.push_back(std::move(q2));
 
         BOOST_CHECK(q3[0].full());
-        BOOST_CHECK_EQUAL(1, q3[0].cancel());
+        BOOST_CHECK_EQUAL(2, q3[0].limit()); // Лимит от исходной очереди.
+        BOOST_CHECK_EQUAL(1, q3[0].cancel()); // В ожидании одна операция, которую и почистили (тредпул не зависнет).
     });
 
     ThreadPool{ ioc, 4 }.join();
+
+    // Исходная и промежуточная очереди пусты.
 
     BOOST_CHECK(q1.empty());
     BOOST_CHECK_EQUAL(0, q1.cancel());

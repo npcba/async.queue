@@ -191,15 +191,22 @@ public:
 
         if (m_queue.size() < m_limit)
         {
+            // Место есть, просто вставляем
             m_queue.push(std::forward<U>(val));
             lkGuard.unlock();
 
+            // Сообщаем, что вставка прошла.
             invokePushHandler(init.completion_handler, boost::system::error_code{});
 
             return init.result.get();
         }
 
-        // Превышен лимит, откладываем
+        // Превышен лимит, откладываем операцию вставки.
+
+        // work нужен, чтобы лямбда держала executor и предотвращала от выхода из run,
+        // пока отложенный push не будет выполнен.
+        // В этот момент в очереди asio executor может быть и пусто,
+        // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
 
         m_pendingPush.push([
@@ -214,8 +221,12 @@ public:
                     self.m_queue.push(std::move(val));
 
                 self.invokePushHandler(std::move(handler), ec);
+                work.reset();
             });
 
+        // Обязательно нужно разлочиться до вызова init.result.get(), потому что
+        // в случае работы на корутинах внутри get корутина уходит в суспенд,
+        // и мьютекс на неопределенное время будет заблокирован.
         lkGuard.unlock();
         return init.result.get();
     }
@@ -243,6 +254,7 @@ public:
             , void(boost::system::error_code, optional<value_type>&&)
             > init{ token };
 
+        // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
               std::is_convertible<
                   decltype(init.completion_handler)
@@ -251,19 +263,28 @@ public:
             , "Handler signature must be void(const boost::system::error_code&, optional<T>&&)"
             );
 
+        // Начинаем блокироваться тут.
         LockGuard lkGuard{ *this };
 
         if (m_queue.empty() && !m_pendingPush.empty())
         {
+            // Очередь пуста, но есть ожидающий вставки (такое может быть при очереди с лимитом 0)
+
+            // Особенность: в данном методе прокинуть между ожидающим вставки и ожидающим извлечения
+            // в обход очереди как в asyncPush не получается
+            // (нет доступа к val, сохраненному в лямбде в m_pendingPush).
+            // Поэтому даем вставке исполниться (тем самым вставляя в очередь, даже если у нее лимит 0).
             m_pendingPush.front()(*this, boost::system::error_code{});
             m_pendingPush.pop();
             assert(1 == m_queue.size());
 
+            // Сообщаем, что извлечение прошло.
             invokePopHandler(
                   init.completion_handler
                 , boost::system::error_code{}
                 , std::move(m_queue.front())
                 );
+            // И извлекаем этот единственный элемент.
             m_queue.pop();
 
             lkGuard.unlock();
@@ -272,6 +293,12 @@ public:
 
         if (m_queue.empty())
         {
+            // Очередь пустая, но никто не ждет вставки, откладываем операцию извлечения.
+
+            // work нужен, чтобы лямбда держала executor и предотвращала от выхода из run,
+            // пока отложенный push не будет выполнен.
+            // В этот момент в очереди asio executor может быть и пусто,
+            // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
             auto work = boost::asio::make_work_guard(m_ex);
             m_pendingPop.push([
                   handler{ init.completion_handler }
@@ -282,25 +309,32 @@ public:
                 , optional<value_type>&& val
                 ) mutable {
                     self.invokePopHandler(std::move(handler), ec, std::move(val));
+                    work.reset();
                 });
 
             lkGuard.unlock();
             return init.result.get();
         }
 
+        // Очередь не пустая, сообщаем об извлечении.
         invokePopHandler(
               init.completion_handler
             , boost::system::error_code{}
             , std::move(m_queue.front())
             );
+        // Извлекаем.
         m_queue.pop();
 
         if (!m_pendingPush.empty())
         {
+            // Есть ждущие вставки, исполняем отложенную вставку, т.к. освободилось место.
             m_pendingPush.front()(*this, boost::system::error_code{});
             m_pendingPush.pop();
         }
 
+        // Обязательно нужно разлочиться до вызова init.result.get(), потому что
+        // в случае работы на корутинах внутри get корутина уходит в суспенд,
+        // и мьютекс на неопределенное время будет заблокирован.
         lkGuard.unlock();
         return init.result.get();
     }
@@ -497,6 +531,10 @@ private:
     std::queue<
         std::function<void(Queue&, const boost::system::error_code&, optional<value_type>&&)>
         > m_pendingPop;
+
+    // TODO: m_pendingPush можно переделать на пары std::function и value_type, чтобы не хранить элементы внутри лямбды.
+    // Лямбда оборачивается в std::function, а она в свою очередь требует от содержимого CopyConstructible,
+    // что в свою очередь требует CopyConstructible от value_type.
 };
 
 } // namespace async

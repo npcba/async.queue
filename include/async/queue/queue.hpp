@@ -14,10 +14,10 @@
 #include <boost/asio/post.hpp>
 #include <boost/core/noncopyable.hpp>
 
-#ifdef __cpp_lib_optional
-#   include <optional>
-#else
+#if defined(BA_ASYNC_USE_BOOST_OPTIONAL) || !defined(__cpp_lib_optional)
 #   include <boost/optional/optional.hpp>
+#else
+#   include <optional>
 #endif
 
 // Библиотека использует недокументированный boost::asio::detail::binder и move_binder
@@ -32,12 +32,12 @@
 namespace ba {
 namespace async {
 
-#ifdef __cpp_lib_optional
-    template <typename T>
-    using optional = std::optional<T>;
-#else
+#if defined(BA_ASYNC_USE_BOOST_OPTIONAL) || !defined(__cpp_lib_optional)
     template <typename T>
     using optional = boost::optional<T>;
+#else
+    template <typename T>
+    using optional = std::optional<T>;
 #endif
 
 

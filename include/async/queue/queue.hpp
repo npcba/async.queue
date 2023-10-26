@@ -5,7 +5,6 @@
 #include <functional>
 #include <mutex>
 
-#include <boost/optional/optional.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/asio/executor.hpp>
 #include <boost/asio/execution_context.hpp>
@@ -14,6 +13,12 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/core/noncopyable.hpp>
+
+#ifdef __cpp_lib_optional
+#   include <optional>
+#else
+#   include <boost/optional/optional.hpp>
+#endif
 
 // Библиотека использует недокументированный boost::asio::detail::binder и move_binder
 // Они широко используется во внутренностях asio, и, вероятно, его поддержка не иссякнет.
@@ -26,6 +31,15 @@
 
 namespace ba {
 namespace async {
+
+#ifdef __cpp_lib_optional
+    template <typename T>
+    using optional = std::optional<T>;
+#else
+    template <typename T>
+    using optional = boost::optional<T>;
+#endif
+
 
 /// Асинхронная очередь с ограничением длины (минимум 0).
 /**
@@ -132,6 +146,8 @@ public:
     template <typename U, typename PushToken>
     auto asyncPush(U&& val, PushToken&& token)
     {
+        // Можно было бы определить аргумент val как value_type, но лишившись perfect forwarding.
+        // Поэтому U&& и с проверкой is_convertible.
         static_assert(std::is_convertible<U, value_type>::value, "val must converts to value_type");
 
         boost::asio::async_completion<
@@ -139,6 +155,7 @@ public:
             , void(boost::system::error_code)
             > init{ token };
 
+        // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
               std::is_convertible<
                   decltype(init.completion_handler)
@@ -147,16 +164,24 @@ public:
             , "Handler signature must be void(const boost::system::error_code&)"
             );
 
+        // Начинаем блокироваться тут.
         LockGuard lkGuard{ *this };
 
-        if (m_queue.empty() && !m_pendingPop.empty()) // голодная очередь
+        if (m_queue.empty() && !m_pendingPop.empty())
         {
+            // Голодная очередь, ждут появления элемента.
+            // В идеале в программе так должно быть большую часть времени,
+            // когда разгребают быстрее, чем накидывают.
+            // В данном случае нет необходимости класть в очередь, чтобы сразу достать обратно.
+
+            // Сообщаем, что вставка прошла.
             invokePushHandler(init.completion_handler, boost::system::error_code{});
 
+            // Прокидываем элемент ждущему на asyncPop
             m_pendingPop.front()(
                   *this
                 , boost::system::error_code{}
-                , boost::make_optional(std::forward<U>(val))
+                , optional<value_type>(std::forward<U>(val))
                 );
             m_pendingPop.pop();
 
@@ -178,7 +203,7 @@ public:
         auto work = boost::asio::make_work_guard(m_ex);
 
         m_pendingPush.push([
-              val{ std::forward<U>(val) }
+              val = value_type{ std::forward<U>(val) }
             , handler{ init.completion_handler }
             , work{ std::move(work) }
             ](
@@ -202,28 +227,28 @@ public:
      * @param token должен порождать хендлер или быть хендлером с сигнатурой:
      * @code void handler(
      *       const boost::system::error_code& error // результат операции
-     *     , boost::optional<T>&& value // извлеченное значение
+     *     , optional<T>&& value // извлеченное значение
      * ); @endcode
      * :)
      * Если очередь пуста, извлечение элемента и вызов handler произойдет
      * после очередного вызова @ref asyncPush.
      * При отмене ожидаемой операции error == boost::asio::error::operation_aborted и
-     * value == boost::none
+     * value == optional<T>{}
      */
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
     {
         boost::asio::async_completion<
               PopToken
-            , void(boost::system::error_code, boost::optional<value_type>&&)
+            , void(boost::system::error_code, optional<value_type>&&)
             > init{ token };
 
         static_assert(
               std::is_convertible<
                   decltype(init.completion_handler)
-                , std::function<void(const boost::system::error_code&, boost::optional<value_type>&&)>
+                , std::function<void(const boost::system::error_code&, optional<value_type>&&)>
                 >::value
-            , "Handler signature must be void(const boost::system::error_code&, boost::optional<T>&&)"
+            , "Handler signature must be void(const boost::system::error_code&, optional<T>&&)"
             );
 
         LockGuard lkGuard{ *this };
@@ -254,7 +279,7 @@ public:
                 ](
                   Queue& self
                 , const boost::system::error_code& ec
-                , boost::optional<value_type>&& val
+                , optional<value_type>&& val
                 ) mutable {
                     self.invokePopHandler(std::move(handler), ec, std::move(val));
                 });
@@ -338,7 +363,7 @@ public:
         if (m_pendingPop.empty())
             return 0;
 
-        m_pendingPop.front()(*this, boost::asio::error::operation_aborted, boost::none);
+        m_pendingPop.front()(*this, boost::asio::error::operation_aborted, optional<value_type>{});
         m_pendingPop.pop();
 
         return 1;
@@ -373,8 +398,7 @@ public:
         LockGuard lkGuard{ *this };
 
         // У std::queue не clear :)
-        container_type empty;
-        std::swap(m_queue, empty);
+        m_queue = container_type{};
 
         return cancel();
     }
@@ -431,7 +455,7 @@ private:
     void invokePopHandler(
           PopHandler&& handler
         , const boost::system::error_code& ec
-        , boost::optional<value_type>&& val
+        , optional<value_type>&& val
         )
     {
         auto handlerCopy = std::forward<PopHandler>(handler);
@@ -440,7 +464,7 @@ private:
         boost::asio::detail::move_binder2<
               decltype(handlerCopy)
             , boost::system::error_code
-            , boost::optional<value_type>
+            , optional<value_type>
             > binder{
                   0
                 , std::move(handlerCopy)
@@ -471,7 +495,7 @@ private:
 
     // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
     std::queue<
-        std::function<void(Queue&, const boost::system::error_code&, boost::optional<value_type>&&)>
+        std::function<void(Queue&, const boost::system::error_code&, optional<value_type>&&)>
         > m_pendingPop;
 };
 

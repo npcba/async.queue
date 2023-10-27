@@ -32,7 +32,6 @@ private:
     std::vector<std::thread> m_threads;
 };
 
-
 BOOST_AUTO_TEST_CASE(strandTest)
 {
     boost::asio::io_context ioc;
@@ -236,7 +235,6 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
     // Compile-time гарантий дать не получится, т.к. std::function, на базе которой
     // реализованы отложенные операции, требует CopyConstructible.
     // Элементы связываются лямбдой и оборачиваются в std::function.
-
     struct Movable
     {
         Movable() = default;

@@ -56,6 +56,7 @@ class Queue
 public:
     using container_type = Container;
     using value_type = typename container_type::value_type;
+    /// Тип executor'а, нужен для работы trait boost::asio::associated_executor.
     using executor_type = Executor;
 
     /// Создает очередь элементов типа T.
@@ -339,6 +340,14 @@ public:
         return init.result.get();
     }
 
+    /// Возвращает executor, ассоциированный с объектом.
+    /// Нужен для работы trait boost::asio::associated_executor.
+    executor_type get_executor() const
+    {
+        LockGuard lkGuard{ *this };
+        return m_ex;
+    }
+
     bool empty() const
     {
         LockGuard lkGuard{ *this };
@@ -357,7 +366,7 @@ public:
         return m_queue.size();
     }
 
-    std::size_t limit() const noexcept
+    std::size_t limit() const
     {
         LockGuard lkGuard{ *this };
         return m_limit;
@@ -450,7 +459,7 @@ private:
             m_self.checkInvariant();
         }
 
-        ~LockGuard() noexcept
+        ~LockGuard()
         {
             if (m_lk)
                 m_self.checkInvariant();
@@ -509,7 +518,7 @@ private:
         boost::asio::post(m_ex, std::move(binder));
     }
 
-    void checkInvariant() const noexcept
+    void checkInvariant() const
     {
         assert(m_queue.size() <= m_limit);
         assert(m_queue.empty() || m_pendingPop.empty());

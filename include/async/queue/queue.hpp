@@ -6,7 +6,6 @@
 #include <queue>
 #include <functional>
 #include <mutex>
-#include <memory>
 
 #include <boost/system/error_code.hpp>
 #include <boost/asio/executor.hpp>
@@ -61,7 +60,6 @@ public:
     using value_type = typename container_type::value_type;
     /// Тип executor'а, нужен для работы trait boost::asio::associated_executor.
     using executor_type = Executor;
-    using work_guard_type = boost::asio::executor_work_guard<executor_type>;
 
     /// Создает очередь элементов типа T.
     /**
@@ -116,7 +114,6 @@ public:
         reset();
         // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
         m_ex = other.m_ex;
-        m_work = std::move(other.m_work); // А work нужно забрать, чтобы other не держал executor.
         m_limit = other.m_limit;
         m_queue = std::move(other.m_queue);
         m_pendingPush = std::move(other.m_pendingPush);
@@ -318,7 +315,6 @@ private:
 
     Queue(Queue&& other, const LockGuard&)
         : m_ex{ other.m_ex } // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
-        , m_work{ std::move(other.m_work) } // А work нужно забрать, чтобы other не держал executor.
         , m_limit{ other.m_limit }
         , m_queue{ std::move(other.m_queue) }
         , m_pendingPush{ std::move(other.m_pendingPush) }
@@ -481,9 +477,11 @@ private:
         // пока отложенный push не будет выполнен.
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
+        auto work = boost::asio::make_work_guard(m_ex);
         m_pendingPush.emplace([
               val{ std::move(val) }
             , handler{ std::forward<Handler>(handler) }
+            , work{ std::move(work) }
             ](
               Queue& self
             , const boost::system::error_code& ec
@@ -492,8 +490,6 @@ private:
             }
             , boost::asio::get_associated_allocator(handler)
             );
-
-        onExecutorWorkStarted();
     }
 
     template <typename Handler>
@@ -503,7 +499,11 @@ private:
         // пока отложенный push не будет выполнен.
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
-        m_pendingPop.emplace([handler{ std::forward<Handler>(handler) }] (
+        auto work = boost::asio::make_work_guard(m_ex);
+        m_pendingPop.emplace([
+              handler{ std::forward<Handler>(handler) }
+            , work{ std::move(work) }
+            ](
               Queue& self
             , optional<value_type>&& val
             , const boost::system::error_code& ec
@@ -512,15 +512,12 @@ private:
             }
             , boost::asio::get_associated_allocator(handler)
             );
-
-        onExecutorWorkStarted();
     }
 
     void doPendingPush(const boost::system::error_code& ec = {})
     {
         m_pendingPush.front()(*this, ec);
         m_pendingPush.pop();
-        onExecutorWorkFinished();
     }
 
     void doPendingPop(optional<value_type>&& val, const boost::system::error_code& ec = {})
@@ -528,20 +525,6 @@ private:
         // Прокидываем элемент ждущему на asyncPop
         m_pendingPop.front()(*this, std::move(val), ec);
         m_pendingPop.pop();
-        onExecutorWorkFinished();
-    }
-
-    void onExecutorWorkStarted()
-    {
-        if (!m_work)
-            m_work = std::make_unique<work_guard_type>(m_ex);
-    }
-
-    void onExecutorWorkFinished()
-    {
-        assert(m_work);
-        if (m_pendingPush.empty() && m_pendingPop.empty())
-            m_work.reset();
     }
 
     void checkInvariant() const
@@ -549,13 +532,11 @@ private:
         assert(m_queue.size() <= m_limit);
         assert(m_queue.empty() || m_pendingPop.empty());
         assert(m_queue.size() == m_limit || m_pendingPush.empty());
-        assert(m_work || 0 == m_pendingPush.size() + m_pendingPop.size());
     }
 
 private:
     mutable std::recursive_mutex m_mutex;
     executor_type m_ex;
-    std::unique_ptr<work_guard_type> m_work;
     std::size_t m_limit = 0;
     container_type m_queue;
 

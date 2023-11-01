@@ -232,37 +232,67 @@ BOOST_AUTO_TEST_CASE(manyConsumerTest)
 BOOST_AUTO_TEST_CASE(moveValueTest)
 {
     // Проверка, что элементы очереди всегда перемещается, но не копируются.
-    // Compile-time гарантий дать не получится, т.к. std::function, на базе которой
-    // реализованы отложенные операции, требует CopyConstructible.
-    // Элементы связываются лямбдой и оборачиваются в std::function.
+    // (compile-time test)
     struct Movable
     {
         Movable() = default;
         Movable(Movable&&) = default;
         Movable& operator=(Movable&&) = default;
-        Movable& operator=(const Movable&) = delete;
 
-        Movable(const Movable&)
-        {
-            BOOST_TEST_ERROR("Movement value test failed");
-        }
+        Movable& operator=(const Movable&) = delete;
+        Movable(const Movable&) = delete;
     };
 
     boost::asio::io_context ioc;
     ba::async::Queue<Movable> q{ ioc, 10 };
 
+    q.asyncPush(Movable{}, [](boost::system::error_code) {});
+    q.asyncPop([](boost::system::error_code, ba::async::optional<Movable> val) {});
+
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
-        for (std::size_t i = 1; i <= 1'000; ++i)
-            q.asyncPush(Movable{}, yield);
+        q.asyncPush(Movable{}, yield);
     });
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
-        for (std::size_t i = 1; i <= 1'000; ++i)
-            Movable m = std::move(q.asyncPop(yield).value());
+        Movable m = std::move(q.asyncPop(yield).value());
     });
+
+    std::future<void> fPush = q.asyncPush(Movable{}, boost::asio::use_future);
+    std::future<ba::async::optional<Movable>> fPop = q.asyncPop(boost::asio::use_future);
 
     ThreadPool{ ioc, 4 }.join();
+
+    fPush.get();
+    ba::async::optional<Movable> val = fPop.get();
 }
+
+#if BOOST_VERSION >= 107000
+BOOST_AUTO_TEST_CASE(moveHandlerTest)
+{
+    // Проверка, что хендлеры всегда перемещаются, но не копируются.
+    // (compile-time test)
+    struct MovableHandler
+    {
+        MovableHandler() = default;
+        MovableHandler(MovableHandler&&) = default;
+        MovableHandler& operator=(MovableHandler&&) = default;
+
+        MovableHandler& operator=(const MovableHandler&) = delete;
+        MovableHandler(const MovableHandler&) = delete;
+
+        void operator()(boost::system::error_code) const {}
+        void operator()(boost::system::error_code, ba::async::optional<int>) const {}
+    };
+
+    boost::asio::io_context ioc;
+    ba::async::Queue<int> q{ ioc, 10 };
+
+    q.asyncPush(123, MovableHandler{});
+    q.asyncPop(MovableHandler{});
+
+    ThreadPool{ ioc, 2 }.join();
+}
+#endif
 
 BOOST_AUTO_TEST_CASE(moveQueueTest)
 {
@@ -308,4 +338,82 @@ BOOST_AUTO_TEST_CASE(moveQueueTest)
 
     BOOST_CHECK(q2.empty());
     BOOST_CHECK_EQUAL(0, q2.cancel());
+}
+
+template <typename T>
+class handler_allocator
+{
+public:
+    using value_type = T;
+
+    explicit handler_allocator() = default;
+
+    template <typename U>
+    handler_allocator(const handler_allocator<U>& other) noexcept
+    {
+    }
+
+    bool operator==(const handler_allocator& other) const noexcept
+    {
+        return true;
+    }
+
+    bool operator!=(const handler_allocator& other) const noexcept
+    {
+        return false;
+    }
+
+    T* allocate(std::size_t n) const
+    {
+        T* p = nullptr;
+        return (T*)::operator new(sizeof(T) * n);
+    }
+
+    void deallocate(T* p, std::size_t) const
+    {
+        return operator delete(p);
+    }
+};
+
+BOOST_AUTO_TEST_CASE(allocatorTest)
+{
+    struct Handler
+    {
+        Handler() = default;
+        Handler(const Handler&)
+        {
+            auto a = 1;
+        }
+
+        Handler(Handler&&)
+        {
+            auto a = 1;
+        }
+
+        using allocator_type = handler_allocator<Handler>;
+
+        allocator_type get_allocator() const noexcept
+        {
+            return allocator_type{};
+        }
+
+        void operator()(boost::system::error_code ec)
+        {
+            auto e = ec;
+        }
+
+        void operator()(boost::system::error_code ec, ba::async::optional<int>)
+        {
+            auto e = ec;
+        }
+    };
+
+    boost::asio::io_context ioc;
+    ba::async::Queue<int> q{ ioc, 0 };
+    q.asyncPush(1, Handler{});
+    q.asyncPop(Handler{});
+
+    //boost::asio::steady_timer
+
+    ThreadPool(ioc, 10).join();
 }

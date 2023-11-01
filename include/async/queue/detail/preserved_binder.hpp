@@ -11,6 +11,7 @@
 
 namespace ba {
 namespace async {
+namespace detail {
 
 template<typename F, typename Tuple, std::size_t... I>
 constexpr decltype(auto)
@@ -70,6 +71,7 @@ auto preservedBind(F&& f, Args&&... args)
     return PreservedBinder<F, Args...>{ std::forward<F>(f), std::forward<Args>(args)... };
 }
 
+} // namespace detail
 } // namespace async
 } // namespace ba
 
@@ -91,11 +93,11 @@ namespace boost {
 namespace asio {
 
 template <typename F, typename... Args, typename Executor>
-struct associated_executor<ba::async::PreservedBinder<F, Args...>, Executor>
+struct associated_executor<ba::async::detail::PreservedBinder<F, Args...>, Executor>
 {
     typedef typename associated_executor<F, Executor>::type type;
 
-    static type get(const ba::async::PreservedBinder<F, Args...>& b,
+    static type get(const ba::async::detail::PreservedBinder<F, Args...>& b,
         const Executor& ex = Executor()) BOOST_ASIO_NOEXCEPT
     {
         return associated_executor<F, Executor>::get(b.get_inner(), ex);
@@ -103,11 +105,11 @@ struct associated_executor<ba::async::PreservedBinder<F, Args...>, Executor>
 };
 
 template <typename F, typename... Args, typename Allocator>
-struct associated_allocator<ba::async::PreservedBinder<F, Args...>, Allocator>
+struct associated_allocator<ba::async::detail::PreservedBinder<F, Args...>, Allocator>
 {
     typedef typename associated_allocator<F, Allocator>::type type;
 
-    static type get(const ba::async::PreservedBinder<F, Args...>& b,
+    static type get(const ba::async::detail::PreservedBinder<F, Args...>& b,
       const Allocator& a = Allocator()) BOOST_ASIO_NOEXCEPT
     {
         return associated_allocator<F, Allocator>::get(b.get_inner(), a);
@@ -116,7 +118,7 @@ struct associated_allocator<ba::async::PreservedBinder<F, Args...>, Allocator>
 
 template <typename F, typename... Args>
 inline bool asio_handler_is_continuation(
-    ba::async::PreservedBinder<F, Args...>* this_handler)
+    ba::async::detail::PreservedBinder<F, Args...>* this_handler)
 {
     assert(this_handler);
     return handler_cont_helpers::is_continuation(this_handler->get_inner());

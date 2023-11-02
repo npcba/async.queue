@@ -566,19 +566,12 @@ public:
 
     ~LockGuard()
     {
-        if (m_lk)
-            m_self.checkInvariant();
-    }
-
-    void unlock()
-    {
         m_self.checkInvariant();
-        m_lk.unlock();
     }
 
 private:
     const Queue& m_self;
-    std::unique_lock<std::recursive_mutex> m_lk;
+    std::lock_guard<std::recursive_mutex> m_lk;
 };
 
 #if BOOST_VERSION >= 107000
@@ -586,7 +579,7 @@ template <typename T, typename Executor, typename Container>
 class Queue<T, Executor, Container>::AsyncInit
 {
 public:
-    using executor_type = typename AsyncInit::executor_type;
+    using executor_type = typename Queue::executor_type;
 
     AsyncInit(Queue& self)
         : m_self{ self }

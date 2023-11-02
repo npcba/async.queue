@@ -1,10 +1,10 @@
 #pragma once
 
 #include "detail/function.hpp"
+#include "detail/check_signature.hpp"
 
 #include <type_traits>
 #include <queue>
-#include <functional>
 #include <mutex>
 
 #include <boost/system/error_code.hpp>
@@ -151,7 +151,7 @@ public:
     {
         // Можно было бы определить аргумент val как value_type, но лишившись perfect forwarding.
         // Поэтому U&& и с проверкой is_convertible.
-        static_assert(std::is_convertible<U, value_type>::value, "val must converts to value_type");
+        static_assert(std::is_convertible<U, value_type>::value, "'val' must converts to 'value_type'");
 #if BOOST_VERSION >= 107000
         return boost::asio::async_initiate<PushToken, void(boost::system::error_code)>(
             AsyncInit{ *this }, token, std::forward<U>(val)
@@ -327,11 +327,11 @@ private:
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-              std::is_convertible<
+              ba::async::detail::CheckSignature<
                   decltype(handler)
-                , std::function<void(const boost::system::error_code&)>
+                , void(const boost::system::error_code&)
                 >::value
-            , "Handler signature must be void(const boost::system::error_code&)"
+            , "Handler signature must be 'void(const boost::system::error_code&)'"
             );
 
         // Начинаем блокироваться тут.
@@ -370,11 +370,11 @@ private:
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-              std::is_convertible<
+            ba::async::detail::CheckSignature<
                   decltype(handler)
-                , std::function<void(const boost::system::error_code&, optional<value_type>)>
+                , void(const boost::system::error_code&, optional<value_type>)
                 >::value
-            , "Handler signature must be void(const boost::system::error_code&, optional<T>)"
+            , "Handler signature must be 'void(const boost::system::error_code&, optional<T>)'"
             );
 
         // Начинаем блокироваться тут.

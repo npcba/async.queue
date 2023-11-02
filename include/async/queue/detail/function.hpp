@@ -42,7 +42,7 @@ public:
 
             R operator()(Args... args) override
             {
-                return m_f(std::forward<Args>(args)...);
+                return R(m_f(std::forward<Args>(args)...));
             }
 
             void destruct() override

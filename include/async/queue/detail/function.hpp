@@ -4,7 +4,7 @@
 #include <cassert>
 
 #include <boost/core/noncopyable.hpp>
-#include<boost/scope_exit.hpp>
+#include <boost/scope_exit.hpp>
 
 
 namespace ba {
@@ -22,7 +22,12 @@ public:
     function& operator=(const function&) = delete;
 
     template <typename F, typename Alloc>
-    function(F f, const Alloc& a)
+    function(F& f, const Alloc& a) = delete;
+    template <typename F, typename Alloc>
+    function(const F& f, const Alloc& a) = delete;
+
+    template <typename F, typename Alloc>
+    function(F&& f, const Alloc& a)
     {
         class Holder
             : public Callable
@@ -67,7 +72,7 @@ public:
         m_callable.reset(p);
     }
 
-    R operator()(Args... args)
+    R operator()(Args... args) const
     {
         return (*m_callable)(std::forward<Args>(args)...);
     }

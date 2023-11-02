@@ -417,3 +417,40 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
 
     ThreadPool(ioc, 10).join();
 }
+
+#if defined(__cpp_impl_coroutine) && defined(__cpp_lib_coroutine) && BOOST_VERSION >= 107000
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/use_awaitable.hpp>
+
+BOOST_AUTO_TEST_CASE(cpp20CoroTest)
+{
+    boost::asio::io_context ioc;
+    ba::async::Queue<std::size_t> q{ ioc, 10 };
+
+    // Одна корутина толкает.
+    co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
+        // Вставляем от 1 до 10 000.
+        for (std::size_t i = 1; i <= 10'000; ++i)
+            co_await q.asyncPush(i, boost::asio::use_awaitable);
+    }, boost::asio::detached);
+
+    // Другая тянет
+    co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
+        std::size_t sum = 0;
+        // Суммируем все извлеченное.
+        for (std::size_t i = 1; i <= 10'000; ++i)
+            BOOST_CHECK_NO_THROW(sum += (co_await q.asyncPop(boost::asio::use_awaitable)).value());
+
+        // Проверяем полученную сумму.
+        BOOST_CHECK_EQUAL(50005000, sum);
+    }, boost::asio::detached);
+
+    // Синхронизации между корутинами намерено нет.
+    // 10 потоков в пуле.
+    ThreadPool{ ioc, 10 }.join();
+
+    BOOST_CHECK(q.empty());
+    BOOST_CHECK_EQUAL(0, q.cancel());
+}
+#endif // defined(__cpp_impl_coroutine) && defined(__cpp_lib_coroutine) && BOOST_VERSION >= 107000

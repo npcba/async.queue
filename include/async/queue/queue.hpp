@@ -1,7 +1,7 @@
 #pragma once
 
 #include "detail/function.hpp"
-#include "detail/check_signature.hpp"
+#include "detail/check_callable.hpp"
 
 #include <type_traits>
 #include <queue>
@@ -327,7 +327,7 @@ private:
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-              ba::async::detail::CheckSignature<
+              ba::async::detail::CheckCallable<
                   decltype(handler)
                 , void(const boost::system::error_code&)
                 >::value
@@ -370,7 +370,7 @@ private:
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-            ba::async::detail::CheckSignature<
+            ba::async::detail::CheckCallable<
                   decltype(handler)
                 , void(const boost::system::error_code&, optional<value_type>)
                 >::value
@@ -542,12 +542,12 @@ private:
 
     // Здесь хранятся ожидающие операции вставки, когда очередь переолнена.
     std::queue<
-        detail::function<void, Queue&, const boost::system::error_code&>
+        detail::Function<void(Queue&, const boost::system::error_code&)>
         > m_pendingPush;
 
     // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
     std::queue<
-        detail::function<void, Queue&, optional<value_type>&&, const boost::system::error_code&>
+        detail::Function<void(Queue&, optional<value_type>&&, const boost::system::error_code&)>
         > m_pendingPop;
 };
 

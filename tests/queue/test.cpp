@@ -151,7 +151,7 @@ BOOST_AUTO_TEST_CASE(contentTest)
             q.asyncPush(i, yield);
     });
 
-    // Другая тянет
+    // Другая тянет.
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         std::size_t sum = 0;
         // Суммируем все извлеченное.
@@ -365,12 +365,13 @@ public:
 
     T* allocate(std::size_t n) const
     {
-        T* p = nullptr;
+        //std::cout << std::this_thread::get_id() << ": allocate: " << typeid(T).name() << std::endl << std::endl << std::flush;
         return (T*)::operator new(sizeof(T) * n);
     }
 
     void deallocate(T* p, std::size_t) const
     {
+        //std::cout << std::this_thread::get_id() << ": deallocate: " << typeid(*p).name() << std::endl << std::endl << std::flush;
         return operator delete(p);
     }
 };
@@ -399,21 +400,23 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
 
         void operator()(boost::system::error_code ec)
         {
+            //std::cout << std::this_thread::get_id() << ": void operator()(boost::system::error_code ec)" << std::endl << std::endl << std::flush;
             auto e = ec;
         }
 
         void operator()(boost::system::error_code ec, ba::async::optional<int>)
         {
+            //std::cout << std::this_thread::get_id() << ": void operator()(boost::system::error_code ec, ba::async::optional<int>)" << std::endl << std::endl << std::flush;
             auto e = ec;
         }
     };
 
-    boost::asio::io_context ioc;
+    boost::asio::io_context ioc{ 10 };
     ba::async::Queue<int> q{ ioc, 0 };
-    q.asyncPush(1, Handler{});
-    q.asyncPop(Handler{});
-
-    //boost::asio::steady_timer
+    ioc.post([&q]{
+        q.asyncPush(1, Handler{});
+        q.asyncPop(Handler{});
+    });
 
     ThreadPool(ioc, 10).join();
 }
@@ -435,7 +438,7 @@ BOOST_AUTO_TEST_CASE(cpp20CoroTest)
             co_await q.asyncPush(i, boost::asio::use_awaitable);
     }, boost::asio::detached);
 
-    // Другая тянет
+    // Другая тянет.
     co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
         std::size_t sum = 0;
         // Суммируем все извлеченное.

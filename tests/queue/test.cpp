@@ -16,7 +16,7 @@
 class ThreadPool
 {
 public:
-    ThreadPool(boost::asio::io_context&ioc, std::size_t n)
+    ThreadPool(boost::asio::io_context& ioc, std::size_t n)
     {
         while (n--)
             m_threads.emplace_back([&ioc]() { ioc.run(); });
@@ -432,14 +432,14 @@ BOOST_AUTO_TEST_CASE(cpp20CoroTest)
     ba::async::Queue<std::size_t> q{ ioc, 10 };
 
     // Одна корутина толкает.
-    co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
+    boost::asio::co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
         // Вставляем от 1 до 10 000.
         for (std::size_t i = 1; i <= 10'000; ++i)
             co_await q.asyncPush(i, boost::asio::use_awaitable);
     }, boost::asio::detached);
 
     // Другая тянет.
-    co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
+    boost::asio::co_spawn(ioc, [&q]() -> boost::asio::awaitable<void> {
         std::size_t sum = 0;
         // Суммируем все извлеченное.
         for (std::size_t i = 1; i <= 10'000; ++i)

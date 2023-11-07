@@ -36,6 +36,8 @@ public:
 
         typename HolderType::allocator_type ha{ a };
         HolderType* holder = ha.allocate(1);
+        if (!holder)
+            throw std::bad_alloc{};
 
         try
         {

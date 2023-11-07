@@ -4,6 +4,7 @@
 #include <cassert>
 
 #include <boost/core/noncopyable.hpp>
+#include <boost/asio/associated_allocator.hpp>
 
 
 namespace ba {
@@ -11,11 +12,9 @@ namespace async {
 namespace detail {
 
 
-// Movable-only замена std::function для полиморфного хранения разнотипных хендлеров и связанных с ними аллокаторов
+// Movable-only замена std::function для полиморфного хранения разнотипных хендлеров.
 // Возвращает только void, ибо в данной библиотеке другого не нужно (добавить не сложно).
 // Для распределения внутреннего состояния использует пользовательский аллокатор (для поддержки asio).
-// Сам аллокатор также хранится во внутреннем состоянии, т.к. верхушка не знает тип аллокатора.
-// Таким образом стрирается не только тип функции, но и тип аллокатора.
 // operator() вызывает внутренний объект и сразу разрушает его(повторный вызов запрещен,
 // в данной библиотеке он и невозможен).
 // Asio гарантирует своим пользователям, что allocator.deallocate будет вызван строго до вызова хендлера,
@@ -43,20 +42,17 @@ public:
     // Отключены случайные перегрузки, т.к. в конструктор могут попасть универсальные ссылки,
     // а нужны только rvalue-ref.
     template <typename F, typename Alloc>
-    Function(F& f, const Alloc& a) = delete;
+    Function(F& f) = delete;
     template <typename F, typename Alloc>
-    Function(const F& f, const Alloc& a) = delete;
+    Function(const F& f) = delete;
 
     // Инициализируется функтором по rvalue-ref и пользовательским аллокатором.
-    template <typename F, typename Alloc>
-    Function(F&& f, const Alloc& a)
+    template <typename F>
+    Function(F&& f)
     {
-        using HolderType = Holder<F, Alloc>;
-
-        // Ребиндит пользовательский аллокатор на тип холдера.
-        typename HolderType::allocator_type ha{ a };
+        auto ha = Holder<F>::getAllocator(f);
         // Выделяет память под холдер.
-        HolderType* holder = ha.allocate(1);
+        Holder<F>* holder = ha.allocate(1);
         // Стандартный аллокатор бросает исключение, нет гарантии, что пользовательский тоже,
         // приведём поведение к общему.
         if (!holder)
@@ -65,7 +61,7 @@ public:
         try
         {
             // Конструирует холдер на выделенной памяти.
-            new(holder) HolderType{ std::move(f), ha };
+            new(holder) Holder<F>{ std::move(f) };
         }
         catch (...)
         {
@@ -106,15 +102,13 @@ private:
 
     // Хранитель конкретного внутреннего состояния, параметризован пользовательским аллокатором,
     // этим же аллокатором он и размещается в памяти.
-    template <typename F, typename Alloc>
+    template <typename F>
     class Holder
         : public Callable
     {
     public:
-        using allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<Holder>;
-
-        Holder(F&& f, const allocator_type& a)
-            : m_f{ std::move(f) }, m_a{ a }
+        Holder(F&& f)
+            : m_f{ std::move(f) }
         {
         }
 
@@ -128,26 +122,31 @@ private:
             doDestruct();
         }
 
+        static auto getAllocator(F& f)
+        {
+            auto a = boost::asio::get_associated_allocator(f);
+            // Ребиндит пользовательский аллокатор на тип холдера.
+            typename std::allocator_traits<decltype(a)>::template rebind_alloc<Holder> ha{ a };
+            return ha;
+        }
+
     private:
         // Перед удалением себя возвращает стековую копию внутреннего функтора (move-copy).
         F doDestruct()
         {
             // Перемещает на стек функтор.
             F copyF = std::move(m_f);
-            // Копирует на стек аллокатор.
-            allocator_type copyA = m_a;
 
             // Деструктит себя.
             this->~Holder();
             // Освобождает аллокатором память из-под себя.
-            copyA.deallocate(this, 1);
+            getAllocator(copyF).deallocate(this, 1);
 
             // Возвращает копию функтора (аллокатор больше не нужен).
             return copyF;
         }
 
         F m_f;
-        allocator_type m_a;
     };
 
     struct Deleter

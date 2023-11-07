@@ -149,10 +149,10 @@ public:
     template <typename U, typename PushToken>
     auto asyncPush(U&& val, PushToken&& token)
     {
-        // Важно: захват мьютекса в этом медоде делать нельзя,
+        // Важно: захват мьютекса в этом методе делать нельзя,
         // Вконце asio::async_initiate или init.result.get() происходит суспенд корутины
         // (если вызов происходит на ней).
-        // Вместо этого мьютекс лочится в AsyncInit::operator().
+        // Вместо этого мьютекс лочится в initPush.
 
         // Можно было бы определить аргумент val как value_type, но лишившись perfect forwarding.
         // Поэтому U&& и с проверкой is_convertible.
@@ -191,10 +191,10 @@ public:
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
     {
-        // Важно: захват мьютекса в этом медоде делать нельзя,
+        // Важно: захват мьютекса в этом методе делать нельзя,
         // Вконце asio::async_initiate или init.result.get() происходит суспенд корутины
         // (если вызов происходит на ней).
-        // Вместо этого мьютекс лочится в AsyncInit::operator().
+        // Вместо этого мьютекс лочится в initPop.
 
 #if BOOST_VERSION >= 107000
         return boost::asio::async_initiate<PopToken, void(boost::system::error_code, optional<value_type>)>(
@@ -346,6 +346,9 @@ private:
             , "Handler signature must be 'void(const boost::system::error_code&)'"
             );
 
+        // Именно тут блокируемся, а не в asyncPush.
+        LockGuard lkGuard{ *this };
+
         if (m_queue.empty() && !m_pendingPop.empty())
         {
             // Голодная очередь, ждут появления элемента.
@@ -386,6 +389,9 @@ private:
                 >::value
             , "Handler signature must be 'void(const boost::system::error_code&, optional<T>)'"
             );
+
+        // Именно тут блокируемся, а не в asyncPop.
+        LockGuard lkGuard{ *this };
 
         if (m_queue.empty() && !m_pendingPush.empty())
         {
@@ -510,9 +516,7 @@ private:
             , const boost::system::error_code& ec
             ) mutable {
                 self.doPush(std::move(val), std::move(handler), ec);
-            }
-            , boost::asio::get_associated_allocator(handler)
-            );
+            });
     }
 
     template <typename Handler>
@@ -532,9 +536,7 @@ private:
             , const boost::system::error_code& ec
             ) mutable {
                 self.completePop(std::move(val), std::move(handler), ec);
-            }
-            , boost::asio::get_associated_allocator(handler)
-            );
+            });
     }
 
     // Выполняет отложенную вставку.
@@ -622,16 +624,12 @@ public:
     template <typename PushHandler, typename U>
     void operator()(PushHandler&& handler, U&& val) const
     {
-        // Именно тут блокируемся, а не в asyncPush
-        LockGuard lkGuard{ m_self };
         m_self.initPush(std::forward<U>(val), std::forward<PushHandler>(handler));
     }
 
     template <typename PopHandler>
     void operator()(PopHandler&& handler) const
     {
-        // Именно тут блокируемся, а не в asyncPop
-        LockGuard lkGuard{ m_self };
         m_self.initPop(std::forward<PopHandler>(handler));
     }
 

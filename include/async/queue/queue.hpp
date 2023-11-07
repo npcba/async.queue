@@ -217,7 +217,7 @@ public:
     bool full() const
     {
         LockGuard lkGuard{ *this };
-        return m_limit == m_queue.size();
+        return m_queue.size() == m_limit;
     }
 
     std::size_t size() const

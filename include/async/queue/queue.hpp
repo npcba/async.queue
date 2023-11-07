@@ -149,9 +149,15 @@ public:
     template <typename U, typename PushToken>
     auto asyncPush(U&& val, PushToken&& token)
     {
+        // Важно: захват мьютекса в этом медоде делать нельзя,
+        // Вконце asio::async_initiate или init.result.get() происходит суспенд корутины
+        // (если вызов происходит на ней).
+        // Вместо этого мьютекс лочится в AsyncInit::operator().
+
         // Можно было бы определить аргумент val как value_type, но лишившись perfect forwarding.
         // Поэтому U&& и с проверкой is_convertible.
         static_assert(std::is_convertible<U, value_type>::value, "'val' must converts to 'value_type'");
+
 #if BOOST_VERSION >= 107000
         return boost::asio::async_initiate<PushToken, void(boost::system::error_code)>(
             AsyncInit{ *this }, token, std::forward<U>(val)
@@ -185,6 +191,11 @@ public:
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
     {
+        // Важно: захват мьютекса в этом медоде делать нельзя,
+        // Вконце asio::async_initiate или init.result.get() происходит суспенд корутины
+        // (если вызов происходит на ней).
+        // Вместо этого мьютекс лочится в AsyncInit::operator().
+
 #if BOOST_VERSION >= 107000
         return boost::asio::async_initiate<PopToken, void(boost::system::error_code, optional<value_type>)>(
             AsyncInit{ *this }, token
@@ -322,6 +333,7 @@ private:
     {
     }
 
+    // Инициатор вставки.
     template <typename U, typename PushHandler>
     void initPush(U&& val, PushHandler&& handler)
     {
@@ -334,9 +346,6 @@ private:
             , "Handler signature must be 'void(const boost::system::error_code&)'"
             );
 
-        // Начинаем блокироваться тут.
-        LockGuard lkGuard{ *this };
-
         if (m_queue.empty() && !m_pendingPop.empty())
         {
             // Голодная очередь, ждут появления элемента.
@@ -347,7 +356,7 @@ private:
             // Сообщаем, что вставка прошла.
             completePush(std::forward<PushHandler>(handler));
 
-            // Прокидываем элемент ждущему на asyncPop
+            // Прокидываем элемент ждущему на asyncPop.
             doPendingPop(std::forward<U>(val));
 
             return;
@@ -355,7 +364,7 @@ private:
 
         if (m_queue.size() < m_limit)
         {
-            // Место есть, просто вставляем
+            // Место есть, просто вставляем.
             doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
 
             return;
@@ -365,6 +374,7 @@ private:
         deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
     }
 
+    // Инициатор извлечения.
     template <typename PopHandler>
     void initPop(PopHandler&& handler)
     {
@@ -377,9 +387,6 @@ private:
             , "Handler signature must be 'void(const boost::system::error_code&, optional<T>)'"
             );
 
-        // Начинаем блокироваться тут.
-        LockGuard lkGuard{ *this };
-
         if (m_queue.empty() && !m_pendingPush.empty())
         {
             // Очередь пуста, но есть ожидающий вставки (такое может быть при очереди с лимитом 0)
@@ -391,7 +398,7 @@ private:
             doPendingPush();
             assert(1 == m_queue.size());
 
-            // Извлекаем и уведомляем вызовом хендлера.
+            // Извлекаем.
             doPop(std::forward<PopHandler>(handler));
 
             return;
@@ -405,7 +412,7 @@ private:
             return;
         }
 
-        // Очередь не пустая, извлекаем и сообщаем об извлечении.
+        // Очередь не пустая, извлекаем.
         doPop(std::forward<PopHandler>(handler));
 
         if (!m_pendingPush.empty())
@@ -415,15 +422,19 @@ private:
         }
     }
 
+    // Комплитер вставки.
     template <typename PushHandler>
     void completePush(PushHandler&& handler, const boost::system::error_code& ec = {})
     {
+        // Сообщаем о завершении вставки обязательно через post,
+        // выполнение хендлеров асинхронных операций запрещено исполнять внутри функций-инициаторов.
         boost::asio::post(
               m_ex
             , boost::asio::detail::bind_handler(std::forward<PushHandler>(handler), ec)
             );
     }
 
+    // Комплитер извлечения.
     template <typename PopHandler>
     void completePop(
           optional<value_type>&& val
@@ -431,11 +442,19 @@ private:
         , const boost::system::error_code& ec = {}
         )
     {
-        auto handlerCopy = std::forward<PopHandler>(handler);
+        // move_binder2 не умеет форвардить handler, только перемещает.
+        // Копируем, если lvalue-ссылка, иначе форвардим на перемещение (rvalue).
+        using CopyIfLValueRef = std::conditional_t<
+              std::is_lvalue_reference<PopHandler>::value
+            , std::decay_t<PopHandler>
+            , PopHandler
+            >;
+
+        CopyIfLValueRef handlerCopy = std::forward<PopHandler>(handler);
 
         // move_binder2 вместо обычного, чтобы не копировать лишний раз val
         boost::asio::detail::move_binder2<
-              decltype(handlerCopy)
+              std::decay_t<PopHandler>
             , boost::system::error_code
             , optional<value_type>
             > binder{
@@ -445,9 +464,12 @@ private:
                 , std::move(val)
                 };
 
+        // Сообщаем о завершении извлечения обязательно через post,
+        // выполнение хендлеров асинхронных операций запрещено исполнять внутри функций-инициаторов.
         boost::asio::post(m_ex, std::move(binder));
     }
 
+    // Выполняет вставку, если ec == 0, затем уведомляет о завершении (ec != 0 при отмене).
     template <typename U, typename PushHandler>
     void doPush(U&& val, PushHandler&& handler, const boost::system::error_code& ec = {})
     {
@@ -457,6 +479,7 @@ private:
         completePush(std::forward<PushHandler>(handler), ec);
     }
 
+    // Уведомляет о завершении извлечения (ec ==0) или отмене (ec != 0), затем извлекает (при ec == 0).
     template <typename PopHandler>
     void doPop(PopHandler&& handler, const boost::system::error_code& ec = {})
     {
@@ -514,15 +537,16 @@ private:
             );
     }
 
+    // Выполняет отложенную вставку.
     void doPendingPush(const boost::system::error_code& ec = {})
     {
         m_pendingPush.front()(*this, ec);
         m_pendingPush.pop();
     }
 
+    // Выполняет отложенное извлечение.
     void doPendingPop(optional<value_type>&& val, const boost::system::error_code& ec = {})
     {
-        // Прокидываем элемент ждущему на asyncPop
         m_pendingPop.front()(*this, std::move(val), ec);
         m_pendingPop.pop();
     }
@@ -575,10 +599,16 @@ private:
 };
 
 #if BOOST_VERSION >= 107000
+// Обертка-функтор для asio::async_initiate, чтобы не городить лямбду
+// и выставить из нее get_executor() непонятно зачем.
 template <typename T, typename Executor, typename Container>
 class Queue<T, Executor, Container>::AsyncInit
 {
 public:
+    // В документации asio::async_initiate ничего не сказано о возможной поддержке
+    // executor_type / get_executor() в типе инициатора, но тем не менее разработчики asio
+    // в своих компонентах выставляют эти имена из соответствующих инициаторов.
+    // Выставим и мы, не жалко, поскольку они и так есть у нас.
     using executor_type = typename Queue::executor_type;
 
     AsyncInit(Queue& self)
@@ -586,18 +616,26 @@ public:
     {
     }
 
+    // Чтобы не копипастить AsyncInit отдельно для push и pop, в одном классе перегрузим 2 operator(),
+    // благо они отличаются по количеству аргументов.
+
     template <typename PushHandler, typename U>
     void operator()(PushHandler&& handler, U&& val) const
     {
+        // Именно тут блокируемся, а не в asyncPush
+        LockGuard lkGuard{ m_self };
         m_self.initPush(std::forward<U>(val), std::forward<PushHandler>(handler));
     }
 
     template <typename PopHandler>
     void operator()(PopHandler&& handler) const
     {
+        // Именно тут блокируемся, а не в asyncPop
+        LockGuard lkGuard{ m_self };
         m_self.initPop(std::forward<PopHandler>(handler));
     }
 
+    // См. коментарий для using executor_type = ...
     executor_type get_executor() const
     {
         return m_self.get_executor();

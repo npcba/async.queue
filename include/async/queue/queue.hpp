@@ -276,7 +276,7 @@ public:
         if (m_pendingPopQueue.empty())
             return 0;
 
-        doPendingPop(optional<value_type>{}, boost::asio::error::operation_aborted);
+        doPendingPop(boost::asio::error::operation_aborted);
 
         return 1;
     }
@@ -354,32 +354,17 @@ private:
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
-        if (m_queue.empty() && !m_pendingPopQueue.empty())
+        if (full() && m_pendingPopQueue.empty())
         {
-            // Голодная очередь, ждут появления элемента.
-            // В идеале в программе так должно быть большую часть времени,
-            // когда разгребают быстрее, чем накидывают.
-            // В данном случае нет необходимости класть в очередь, чтобы сразу достать обратно.
-
-            // Сообщаем, что вставка прошла.
-            completePush(std::forward<PushHandler>(handler));
-
-            // Прокидываем элемент ждущему на asyncPop.
-            doPendingPop(std::forward<U>(val));
-
+            // Вставлять некуда, откладываем операцию вставки.
+            deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
             return;
         }
 
-        if (m_queue.size() < m_limit)
-        {
-            // Место есть, просто вставляем.
-            doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
+        doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
 
-            return;
-        }
-
-        // Превышен лимит, откладываем операцию вставки.
-        deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
+        if (!m_pendingPopQueue.empty())
+            doPendingPop();
     }
 
     // Инициатор извлечения.
@@ -534,9 +519,9 @@ private:
     }
 
     // Выполняет отложенное извлечение.
-    void doPendingPop(optional<value_type>&& val, const boost::system::error_code& ec = {})
+    void doPendingPop(const boost::system::error_code& ec = {})
     {
-        m_pendingPopQueue.front()(*this, std::move(val), ec);
+        m_pendingPopQueue.front()(*this, ec);
         m_pendingPopQueue.pop();
     }
 
@@ -560,7 +545,7 @@ private:
 
     // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
     std::queue<
-        detail::Function<void(Queue&, optional<value_type>&&, const boost::system::error_code&)>
+        detail::Function<void(Queue&, const boost::system::error_code&)>
         > m_pendingPopQueue;
 };
 
@@ -606,9 +591,9 @@ public:
         return boost::asio::associated_allocator<Handler>::get(m_handler);
     }
 
-    void operator()(Queue& self, optional<value_type>&& val, const boost::system::error_code& ec)
+    void operator()(Queue& self, const boost::system::error_code& ec)
     {
-        self.completePop(std::move(val), std::move(m_handler), ec);
+        self.doPop(std::move(m_handler), ec);
     }
 
 protected:

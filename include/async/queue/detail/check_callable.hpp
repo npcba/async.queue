@@ -7,12 +7,12 @@ namespace ba {
 namespace async {
 namespace detail {
 
-// Trait проверяет на возможность объекта типа F быть вызванным с аргументами типа Args.
-// По-умолчанию не может быть вызван (false).
+// Trait РїСЂРѕРІРµСЂСЏРµС‚ РЅР° РІРѕР·РјРѕР¶РЅРѕСЃС‚СЊ РѕР±СЉРµРєС‚Р° С‚РёРїР° F Р±С‹С‚СЊ РІС‹Р·РІР°РЅРЅС‹Рј СЃ Р°СЂРіСѓРјРµРЅС‚Р°РјРё С‚РёРїР° Args.
+// РџРѕ-СѓРјРѕР»С‡Р°РЅРёСЋ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РІС‹Р·РІР°РЅ (false).
 template <typename F, typename Signature, typename EnableIf = void>
 struct CheckCallable : std::false_type {};
 
-// Сециализация, для корректно-вызываемого F (true).
+// РЎРµС†РёР°Р»РёР·Р°С†РёСЏ, РґР»СЏ РєРѕСЂСЂРµРєС‚РЅРѕ-РІС‹Р·С‹РІР°РµРјРѕРіРѕ F (true).
 template<typename F, typename R, typename... Args>
 struct CheckCallable<
       F
@@ -25,7 +25,7 @@ struct CheckCallable<
               std::result_of_t<F& (Args...)>    // deprecated in C++17, deleted in C++20
 #endif
             , R
-            >::value ||                         // Результат либо конверируется в R, либо void.
+            >::value ||                         // Р РµР·СѓР»СЊС‚Р°С‚ Р»РёР±Рѕ РєРѕРЅРІРµСЂРёСЂСѓРµС‚СЃСЏ РІ R, Р»РёР±Рѕ void.
         std::is_void<R>::value
         >
     >

@@ -64,7 +64,9 @@ public:
     /// Создает очередь элементов типа Elem.
     /**
      * Исполняется на Executor ex.
-     * Огрничена размером limit
+     * Огрничена размером limit.
+     * В некоторых случаях в процессе работы Container может заполняться до размера limit + 1,
+     * но снаружи этого не заметно, важно, чтобы пользовательский Container допускал такой размер.
      */
     explicit Queue(const executor_type& ex, std::size_t limit)
         : m_ex{ ex }
@@ -228,7 +230,7 @@ public:
     bool full() const
     {
         LockGuard lkGuard{ *this };
-        return m_queue.size() == m_limit;
+        return m_queue.size() >= m_limit;
     }
 
     std::size_t size() const

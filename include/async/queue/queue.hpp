@@ -49,9 +49,9 @@ namespace async {
  * Вызывает хендлер завершения после постановки или получения элемента.
  */
 template <
-      typename T
+      typename Elem
     , typename Executor = boost::asio::executor
-    , typename Container = std::queue<T>
+    , typename Container = std::queue<Elem>
     >
 class Queue
 {
@@ -61,7 +61,7 @@ public:
     /// Тип executor'а, нужен для работы trait boost::asio::associated_executor.
     using executor_type = Executor;
 
-    /// Создает очередь элементов типа T.
+    /// Создает очередь элементов типа Elem.
     /**
      * Исполняется на Executor ex.
      * Огрничена размером limit
@@ -73,7 +73,7 @@ public:
         checkInvariant();
     }
 
-    /// Создает очередь элементов типа T.
+    /// Создает очередь элементов типа Elem.
     /**
      * Аналогично с первым конструктором, но достает Executor из context,
      * например, из boost::asio::io_context.
@@ -116,8 +116,8 @@ public:
         m_ex = other.m_ex;
         m_limit = other.m_limit;
         m_queue = std::move(other.m_queue);
-        m_pendingPush = std::move(other.m_pendingPush);
-        m_pendingPop = std::move(other.m_pendingPop);
+        m_pendingPushQueue = std::move(other.m_pendingPushQueue);
+        m_pendingPopQueue = std::move(other.m_pendingPopQueue);
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -180,13 +180,13 @@ public:
      * @param token должен порождать хендлер или быть хендлером с сигнатурой:
      * @code void handler(
      *       const boost::system::error_code& error // результат операции
-     *     , optional<T> value // извлеченное значение
+     *     , optional<Elem> value // извлеченное значение
      * ); @endcode
      * :)
      * Если очередь пуста, извлечение элемента и вызов handler произойдет
      * после очередного вызова @ref asyncPush.
      * При отмене ожидаемой операции error == boost::asio::error::operation_aborted и
-     * value == optional<T>{}
+     * value == optional<Elem>{}
      */
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
@@ -248,7 +248,7 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        if (m_pendingPush.empty())
+        if (m_pendingPushQueue.empty())
             return 0;
 
         doPendingPush(boost::asio::error::operation_aborted);
@@ -273,7 +273,7 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        if (m_pendingPop.empty())
+        if (m_pendingPopQueue.empty())
             return 0;
 
         doPendingPop(optional<value_type>{}, boost::asio::error::operation_aborted);
@@ -320,6 +320,11 @@ private:
     // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
     class LockGuard;
 
+    template <typename Handler>
+    class PendingPopOp;
+    template <typename Handler>
+    class PendingPushOp;
+
 #if BOOST_VERSION >= 107000
     class AsyncInit;
 #endif
@@ -328,8 +333,8 @@ private:
         : m_ex{ other.m_ex } // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
         , m_limit{ other.m_limit }
         , m_queue{ std::move(other.m_queue) }
-        , m_pendingPush{ std::move(other.m_pendingPush) }
-        , m_pendingPop{ std::move(other.m_pendingPop) }
+        , m_pendingPushQueue{ std::move(other.m_pendingPushQueue) }
+        , m_pendingPopQueue{ std::move(other.m_pendingPopQueue) }
     {
     }
 
@@ -349,7 +354,7 @@ private:
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
-        if (m_queue.empty() && !m_pendingPop.empty())
+        if (m_queue.empty() && !m_pendingPopQueue.empty())
         {
             // Голодная очередь, ждут появления элемента.
             // В идеале в программе так должно быть большую часть времени,
@@ -387,19 +392,19 @@ private:
                   decltype(handler)
                 , void(const boost::system::error_code&, optional<value_type>)
                 >::value
-            , "Handler signature must be 'void(const boost::system::error_code&, optional<T>)'"
+            , "Handler signature must be 'void(const boost::system::error_code&, optional<Elem>)'"
             );
 
         // Именно тут блокируемся, а не в asyncPop.
         LockGuard lkGuard{ *this };
 
-        if (m_queue.empty() && !m_pendingPush.empty())
+        if (m_queue.empty() && !m_pendingPushQueue.empty())
         {
             // Очередь пуста, но есть ожидающий вставки (такое может быть при очереди с лимитом 0)
 
             // Особенность: в данном методе прокинуть между ожидающим вставки и ожидающим извлечения
             // в обход очереди как в asyncPush не получается
-            // (нет доступа к val, сохраненному в лямбде в m_pendingPush).
+            // (нет доступа к val, сохраненному в лямбде в m_pendingPushQueue).
             // Поэтому даем вставке исполниться (тем самым вставляя в очередь, даже если у нее лимит 0).
             doPendingPush();
             assert(1 == m_queue.size());
@@ -421,7 +426,7 @@ private:
         // Очередь не пустая, извлекаем.
         doPop(std::forward<PopHandler>(handler));
 
-        if (!m_pendingPush.empty())
+        if (!m_pendingPushQueue.empty())
         {
             // Есть ждущие вставки, исполняем отложенную вставку, т.к. освободилось место.
             doPendingPush();
@@ -499,24 +504,15 @@ private:
         m_queue.pop();
     }
 
-    template <typename Handler>
-    void deferPush(Handler&& handler, value_type val)
+    template <typename Handler, typename U>
+    void deferPush(Handler&& handler, U&& val)
     {
         // work нужен, чтобы лямбда держала executor и предотвращала от выхода из run,
         // пока отложенный push не будет выполнен.
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
-        m_pendingPush.emplace([
-              val{ std::move(val) }
-            , handler{ std::forward<Handler>(handler) }
-            , work{ std::move(work) }
-            ](
-              Queue& self
-            , const boost::system::error_code& ec
-            ) mutable {
-                self.doPush(std::move(val), std::move(handler), ec);
-            });
+        m_pendingPushQueue.emplace(PendingPushOp<std::decay_t<Handler>>{ std::forward<U>(val), std::forward<Handler>(handler), std::move(work)});
     }
 
     template <typename Handler>
@@ -527,37 +523,28 @@ private:
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
-        m_pendingPop.emplace([
-              handler{ std::forward<Handler>(handler) }
-            , work{ std::move(work) }
-            ](
-              Queue& self
-            , optional<value_type>&& val
-            , const boost::system::error_code& ec
-            ) mutable {
-                self.completePop(std::move(val), std::move(handler), ec);
-            });
+        m_pendingPopQueue.emplace(PendingPopOp<std::decay_t<Handler>>{ std::forward<Handler>(handler), std::move(work)});
     }
 
     // Выполняет отложенную вставку.
     void doPendingPush(const boost::system::error_code& ec = {})
     {
-        m_pendingPush.front()(*this, ec);
-        m_pendingPush.pop();
+        m_pendingPushQueue.front()(*this, ec);
+        m_pendingPushQueue.pop();
     }
 
     // Выполняет отложенное извлечение.
     void doPendingPop(optional<value_type>&& val, const boost::system::error_code& ec = {})
     {
-        m_pendingPop.front()(*this, std::move(val), ec);
-        m_pendingPop.pop();
+        m_pendingPopQueue.front()(*this, std::move(val), ec);
+        m_pendingPopQueue.pop();
     }
 
     void checkInvariant() const
     {
         assert(m_queue.size() <= m_limit);
-        assert(m_queue.empty() || m_pendingPop.empty());
-        assert(m_queue.size() == m_limit || m_pendingPush.empty());
+        assert(m_queue.empty() || m_pendingPopQueue.empty());
+        assert(m_queue.size() == m_limit || m_pendingPushQueue.empty());
     }
 
 private:
@@ -569,18 +556,18 @@ private:
     // Здесь хранятся ожидающие операции вставки, когда очередь переолнена.
     std::queue<
         detail::Function<void(Queue&, const boost::system::error_code&)>
-        > m_pendingPush;
+        > m_pendingPushQueue;
 
     // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
     std::queue<
         detail::Function<void(Queue&, optional<value_type>&&, const boost::system::error_code&)>
-        > m_pendingPop;
+        > m_pendingPopQueue;
 };
 
 // Обертка над std::unique_lock.
 // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
-template <typename T, typename Executor, typename Container>
-class Queue<T, Executor, Container>::LockGuard
+template <typename Elem, typename Executor, typename Container>
+class Queue<Elem, Executor, Container>::LockGuard
     : boost::noncopyable
 {
 public:
@@ -600,11 +587,62 @@ private:
     std::lock_guard<std::recursive_mutex> m_lk;
 };
 
+template <typename Elem, typename Executor, typename Container>
+template <typename Handler>
+class Queue<Elem, Executor, Container>::PendingPopOp
+{
+public:
+    PendingPopOp(PendingPopOp&&) = default;
+
+    template <typename H>
+    PendingPopOp(H&& handler, boost::asio::executor_work_guard<executor_type>&& work)
+        : m_handler{ std::forward<H>(handler) }, m_work{ std::move(work) }
+    {
+    }
+
+    using allocator_type = boost::asio::associated_allocator<Handler>::type;
+    allocator_type get_allocator() const
+    {
+        return boost::asio::associated_allocator<Handler>::get(m_handler);
+    }
+
+    void operator()(Queue& self, optional<value_type>&& val, const boost::system::error_code& ec)
+    {
+        self.completePop(std::move(val), std::move(m_handler), ec);
+    }
+
+protected:
+    Handler m_handler;
+    boost::asio::executor_work_guard<executor_type> m_work;
+};
+
+template <typename Elem, typename Executor, typename Container>
+template <typename Handler>
+class Queue<Elem, Executor, Container>::PendingPushOp
+    : public PendingPopOp<Handler>
+{
+public:
+    template <typename U, typename H>
+    PendingPushOp(U&& val, H&& handler, boost::asio::executor_work_guard<executor_type>&& work)
+        : PendingPopOp<Handler>{ std::forward<H>(handler), std::move(work) }
+        , m_val{ std::forward<U>(val) }
+    {
+    }
+
+    void operator()(Queue& self, const boost::system::error_code& ec)
+    {
+        self.doPush(std::move(m_val), std::move(this->m_handler), ec);
+    }
+
+private:
+    value_type m_val;
+};
+
 #if BOOST_VERSION >= 107000
 // Обертка-функтор для asio::async_initiate, чтобы не городить лямбду
 // и выставить из нее get_executor() непонятно зачем.
-template <typename T, typename Executor, typename Container>
-class Queue<T, Executor, Container>::AsyncInit
+template <typename Elem, typename Executor, typename Container>
+class Queue<Elem, Executor, Container>::AsyncInit
 {
 public:
     // В документации asio::async_initiate ничего не сказано о возможной поддержке
@@ -612,6 +650,10 @@ public:
     // в своих компонентах выставляют эти имена из соответствующих инициаторов.
     // Выставим и мы, не жалко, поскольку они и так есть у нас.
     using executor_type = typename Queue::executor_type;
+    executor_type get_executor() const
+    {
+        return m_self.get_executor();
+    }
 
     AsyncInit(Queue& self)
         : m_self{ self }
@@ -631,12 +673,6 @@ public:
     void operator()(PopHandler&& handler) const
     {
         m_self.initPop(std::forward<PopHandler>(handler));
-    }
-
-    // См. коментарий для using executor_type = ...
-    executor_type get_executor() const
-    {
-        return m_self.get_executor();
     }
 
 private:

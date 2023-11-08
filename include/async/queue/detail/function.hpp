@@ -4,7 +4,6 @@
 #include <cassert>
 
 #include <boost/core/noncopyable.hpp>
-#include <boost/asio/associated_allocator.hpp>
 
 
 namespace ba {
@@ -50,7 +49,7 @@ public:
     template <typename F>
     Function(F&& f)
     {
-        auto ha = Holder<F>::getAllocator(f);
+        auto ha = Holder<F>::rebindAllocFrom(f);
         // Выделяет память под холдер.
         Holder<F>* holder = ha.allocate(1);
         // Стандартный аллокатор бросает исключение, нет гарантии, что пользовательский тоже,
@@ -122,9 +121,12 @@ private:
             doDestruct();
         }
 
-        static auto getAllocator(F& f)
+        static auto rebindAllocFrom(F& f)
         {
-            auto a = boost::asio::get_associated_allocator(f);
+            // Возьмем get_allocator напрямую из функтора, это защитит от ошибок,
+            // если функтор случайно перестанет поддерживать get_allocator.
+            // А asio::get_associated_allocator незаметно откатывается в дефолт, нам такое не нужно.
+            auto a = f.get_allocator();
             // Ребиндит пользовательский аллокатор на тип холдера.
             typename std::allocator_traits<decltype(a)>::template rebind_alloc<Holder> ha{ a };
             return ha;
@@ -140,7 +142,7 @@ private:
             // Деструктит себя.
             this->~Holder();
             // Освобождает аллокатором память из-под себя.
-            getAllocator(copyF).deallocate(this, 1);
+            rebindAllocFrom(copyF).deallocate(this, 1);
 
             // Возвращает копию функтора (аллокатор больше не нужен).
             return copyF;

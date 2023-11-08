@@ -354,15 +354,14 @@ private:
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
-        if (full() && m_pendingPopQueue.empty())
-        {
-            // Вставлять некуда, откладываем операцию вставки.
+        // Если лимит не превышен или есть ожидающие извлечения, то вставляем,
+        // иначе откладываем.
+        if (m_queue.size() < m_limit || !m_pendingPopQueue.empty())
+            doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
+        else
             deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
-            return;
-        }
 
-        doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
-
+        // Если есть ожидающие извлечения, выполняем извлечение.
         if (!m_pendingPopQueue.empty())
             doPendingPop();
     }
@@ -383,39 +382,16 @@ private:
         // Именно тут блокируемся, а не в asyncPop.
         LockGuard lkGuard{ *this };
 
-        if (m_queue.empty() && !m_pendingPushQueue.empty())
-        {
-            // Очередь пуста, но есть ожидающий вставки (такое может быть при очереди с лимитом 0)
-
-            // Особенность: в данном методе прокинуть между ожидающим вставки и ожидающим извлечения
-            // в обход очереди как в asyncPush не получается
-            // (нет доступа к val, сохраненному в лямбде в m_pendingPushQueue).
-            // Поэтому даем вставке исполниться (тем самым вставляя в очередь, даже если у нее лимит 0).
-            doPendingPush();
-            assert(1 == m_queue.size());
-
-            // Извлекаем.
-            doPop(std::forward<PopHandler>(handler));
-
-            return;
-        }
-
-        if (m_queue.empty())
-        {
-            // Очередь пустая, но никто не ждет вставки, откладываем операцию извлечения.
-            deferPop(std::forward<PopHandler>(handler));
-
-            return;
-        }
-
-        // Очередь не пустая, извлекаем.
-        doPop(std::forward<PopHandler>(handler));
-
+        // Если есть ождающие вставки, то вставляем.
         if (!m_pendingPushQueue.empty())
-        {
-            // Есть ждущие вставки, исполняем отложенную вставку, т.к. освободилось место.
             doPendingPush();
-        }
+
+        // Если очередь не пуста, то извлекаем,
+        // иначе откладываем.
+        if (!m_queue.empty())
+            doPop(std::forward<PopHandler>(handler));
+        else
+            deferPop(std::forward<PopHandler>(handler));
     }
 
     // Комплитер вставки.
@@ -492,10 +468,6 @@ private:
     template <typename Handler, typename U>
     void deferPush(Handler&& handler, U&& val)
     {
-        // work нужен, чтобы лямбда держала executor и предотвращала от выхода из run,
-        // пока отложенный push не будет выполнен.
-        // В этот момент в очереди asio executor может быть и пусто,
-        // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
         m_pendingPushQueue.emplace(PendingPushOp<std::decay_t<Handler>>{ std::forward<U>(val), std::forward<Handler>(handler), std::move(work)});
     }
@@ -503,10 +475,6 @@ private:
     template <typename Handler>
     void deferPop(Handler&& handler)
     {
-        // work нужен, чтобы лямбда держала executor и предотвращала от выхода из run,
-        // пока отложенный push не будет выполнен.
-        // В этот момент в очереди asio executor может быть и пусто,
-        // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
         m_pendingPopQueue.emplace(PendingPopOp<std::decay_t<Handler>>{ std::forward<Handler>(handler), std::move(work)});
     }
@@ -572,6 +540,8 @@ private:
     std::lock_guard<std::recursive_mutex> m_lk;
 };
 
+// Отложенная операция извлечения.
+// В отличие от лямбды выставляет нужный нам метод get_allocator().
 template <typename Elem, typename Executor, typename Container>
 template <typename Handler>
 class Queue<Elem, Executor, Container>::PendingPopOp
@@ -598,9 +568,16 @@ public:
 
 protected:
     Handler m_handler;
+    // work нужен, чтобы функтор держал executor и предотвращал от выхода из run,
+    // пока отложенная операция не будет выполнена.
+    // В этот момент в очереди asio executor может быть и пусто,
+    // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
     boost::asio::executor_work_guard<executor_type> m_work;
 };
 
+// Отложенная операция вставки.
+// В отличие от лямбды выставляет нужный нам метод get_allocator().
+// Отнаследован от PendingPopOp, чтобы не копипастить одно и то же, хранит все то же самое + value_type.
 template <typename Elem, typename Executor, typename Container>
 template <typename Handler>
 class Queue<Elem, Executor, Container>::PendingPushOp

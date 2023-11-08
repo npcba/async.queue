@@ -50,6 +50,11 @@ public:
     Function(F&& f)
     {
         auto ha = Holder<F>::rebindAllocFrom(f);
+
+        // Проверим на всякий, что пользовательский аллокатор соответствует
+        // как минимум equality requirements.
+        assert(Holder<F>::rebindAllocFrom(f) == ha);
+
         // Выделяет память под холдер.
         Holder<F>* holder = ha.allocate(1);
         // Стандартный аллокатор бросает исключение, нет гарантии, что пользовательский тоже,

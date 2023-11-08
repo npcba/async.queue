@@ -600,7 +600,7 @@ public:
     {
     }
 
-    using allocator_type = boost::asio::associated_allocator<Handler>::type;
+    using allocator_type = boost::asio::associated_allocator_t<Handler>;
     allocator_type get_allocator() const
     {
         return boost::asio::associated_allocator<Handler>::get(m_handler);

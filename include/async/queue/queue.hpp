@@ -356,8 +356,7 @@ private:
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
-        // Если лимит не превышен или есть ожидающие извлечения, то вставляем,
-        // иначе откладываем.
+        // Если лимит не превышен или есть ожидающие извлечения, то вставляем, иначе откладываем.
         if (m_queue.size() < m_limit || !m_pendingPopQueue.empty())
             doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
         else
@@ -365,7 +364,12 @@ private:
 
         // Если есть ожидающие извлечения, выполняем извлечение.
         if (!m_pendingPopQueue.empty())
+        {
+            // Если ждали извлечения, значит до этого уперлись в size == 0, и теперь он стал равен 1.
+            // При m_limit == 0, в очереди кратковременно появится 1 элемент, но снаружи это не заметно.
+            assert(m_queue.size() == 1);
             doPendingPop();
+        }
     }
 
     // Инициатор извлечения.
@@ -386,10 +390,14 @@ private:
 
         // Если есть ождающие вставки, то вставляем.
         if (!m_pendingPushQueue.empty())
+        {
             doPendingPush();
+            // Если ждали вставки, значит до этого уперлись в лимит,
+            // и теперь он будет кратковременно превышен на 1 элемент, но снаружи это не заметно.
+            assert(m_queue.size() == m_limit + 1);
+        }
 
-        // Если очередь не пуста, то извлекаем,
-        // иначе откладываем.
+        // Если очередь не пуста, то извлекаем, иначе откладываем.
         if (!m_queue.empty())
             doPop(std::forward<PopHandler>(handler));
         else
@@ -445,25 +453,17 @@ private:
 
     // Выполняет вставку, если ec == 0, затем уведомляет о завершении (ec != 0 при отмене).
     template <typename U, typename PushHandler>
-    void doPush(U&& val, PushHandler&& handler, const boost::system::error_code& ec = {})
+    void doPush(U&& val, PushHandler&& handler)
     {
-        if (!ec)
-            m_queue.push(std::forward<U>(val));
-
-        completePush(std::forward<PushHandler>(handler), ec);
+        m_queue.push(std::forward<U>(val));
+        completePush(std::forward<PushHandler>(handler), boost::system::error_code{});
     }
 
     // Уведомляет о завершении извлечения (ec ==0) или отмене (ec != 0), затем извлекает (при ec == 0).
     template <typename PopHandler>
-    void doPop(PopHandler&& handler, const boost::system::error_code& ec = {})
+    void doPop(PopHandler&& handler)
     {
-        if (ec)
-        {
-            completePop(optional<value_type>{}, std::forward<PopHandler>(handler), ec);
-            return;
-        }
-
-        completePop(std::move(m_queue.front()), std::forward<PopHandler>(handler), ec);
+        completePop(std::move(m_queue.front()), std::forward<PopHandler>(handler), boost::system::error_code{});
         m_queue.pop();
     }
 
@@ -471,14 +471,25 @@ private:
     void deferPush(Handler&& handler, U&& val)
     {
         auto work = boost::asio::make_work_guard(m_ex);
-        m_pendingPushQueue.emplace(PendingPushOp<std::decay_t<Handler>>{ std::forward<U>(val), std::forward<Handler>(handler), std::move(work)});
+        m_pendingPushQueue.emplace(
+            PendingPushOp<std::decay_t<Handler>>{
+                  std::forward<U>(val)
+                , std::forward<Handler>(handler)
+                , std::move(work)
+                }
+            );
     }
 
     template <typename Handler>
     void deferPop(Handler&& handler)
     {
         auto work = boost::asio::make_work_guard(m_ex);
-        m_pendingPopQueue.emplace(PendingPopOp<std::decay_t<Handler>>{ std::forward<Handler>(handler), std::move(work)});
+        m_pendingPopQueue.emplace(
+            PendingPopOp<std::decay_t<Handler>>{
+                  std::forward<Handler>(handler)
+                , std::move(work)
+                }
+            );
     }
 
     // Выполняет отложенную вставку.
@@ -519,6 +530,7 @@ private:
         > m_pendingPopQueue;
 };
 
+
 // Обертка над std::unique_lock.
 // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
 template <typename Elem, typename Executor, typename Container>
@@ -541,6 +553,7 @@ private:
     const Queue& m_self;
     std::lock_guard<std::recursive_mutex> m_lk;
 };
+
 
 // Отложенная операция извлечения.
 // В отличие от лямбды выставляет нужный нам метод get_allocator().
@@ -565,7 +578,10 @@ public:
 
     void operator()(Queue& self, const boost::system::error_code& ec)
     {
-        self.doPop(std::move(m_handler), ec);
+        if (ec) // Если отмена, то только уведомляем об отмене ожидающего извлечения.
+            self.completePop(optional<value_type>{}, std::move(m_handler), ec);
+        else // Иначе извлекаем как обычно.
+            self.doPop(std::move(m_handler));
     }
 
 protected:
@@ -576,6 +592,7 @@ protected:
     // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
     boost::asio::executor_work_guard<executor_type> m_work;
 };
+
 
 // Отложенная операция вставки.
 // В отличие от лямбды выставляет нужный нам метод get_allocator().
@@ -595,12 +612,16 @@ public:
 
     void operator()(Queue& self, const boost::system::error_code& ec)
     {
-        self.doPush(std::move(m_val), std::move(this->m_handler), ec);
+        if (ec) // Если отмена, то только уведомляем об отмене ожидающей вставки.
+            self.completePush(std::move(this->m_handler), ec);
+        else // Иначе вставляем как обычно.
+            self.doPush(std::move(m_val), std::move(this->m_handler));
     }
 
 private:
     value_type m_val;
 };
+
 
 #if BOOST_VERSION >= 107000
 // Обертка-функтор для asio::async_initiate, чтобы не городить лямбду

@@ -1,7 +1,8 @@
 #pragma once
 
-#include "detail/function.hpp"
+#include "detail/function_queue.hpp"
 #include "detail/check_callable.hpp"
+#include "detail/associated_binder.hpp"
 
 #include <type_traits>
 #include <queue>
@@ -322,11 +323,6 @@ private:
     // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
     class LockGuard;
 
-    template <typename Handler>
-    class PendingPopOp;
-    template <typename Handler>
-    class PendingPushOp;
-
 #if BOOST_VERSION >= 107000
     class AsyncInit;
 #endif
@@ -455,7 +451,7 @@ private:
     template <typename U, typename PushHandler>
     void doPush(U&& val, PushHandler&& handler)
     {
-        m_queue.push(std::forward<U>(val));
+        m_queue.emplace(std::forward<U>(val));
         completePush(std::forward<PushHandler>(handler), boost::system::error_code{});
     }
 
@@ -470,40 +466,57 @@ private:
     template <typename Handler, typename U>
     void deferPush(Handler&& handler, U&& val)
     {
+        // work нужен, чтобы функтор держал executor и предотвращал от выхода из run,
+        // пока отложенная операция не будет выполнена.
+        // В этот момент в очереди asio executor может быть и пусто,
+        // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
-        m_pendingPushQueue.emplace(
-            PendingPushOp<std::decay_t<Handler>>{
-                  std::forward<U>(val)
-                , std::forward<Handler>(handler)
-                , std::move(work)
-                }
-            );
+
+        m_pendingPushQueue.push(detail::bindAssociated(
+            [val{ value_type(std::forward<U>(val)) }, work{ std::move(work) }]
+            (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
+            {
+                if (ec) // Если отмена, то только уведомляем об отмене ожидающей вставки.
+                    self.completePush(std::move(h), ec);
+                else // Иначе вставляем как обычно.
+                    self.doPush(std::move(val), std::move(h));
+            }
+            , std::move(handler))
+        );
     }
 
     template <typename Handler>
     void deferPop(Handler&& handler)
     {
+        // work нужен, чтобы функтор держал executor и предотвращал от выхода из run,
+        // пока отложенная операция не будет выполнена.
+        // В этот момент в очереди asio executor может быть и пусто,
+        // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
-        m_pendingPopQueue.emplace(
-            PendingPopOp<std::decay_t<Handler>>{
-                  std::forward<Handler>(handler)
-                , std::move(work)
-                }
+
+        m_pendingPopQueue.push(detail::bindAssociated(
+            [work{ std::move(work) }]
+            (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
+            {
+                if (ec) // Если отмена, то только уведомляем об отмене ожидающего извлечения.
+                    self.completePop(optional<value_type>{}, std::move(h), ec);
+                else // Иначе извлекаем как обычно.
+                    self.doPop(std::move(h));
+            }
+            , std::move(handler))
             );
     }
 
     // Выполняет отложенную вставку.
     void doPendingPush(const boost::system::error_code& ec = {})
     {
-        m_pendingPushQueue.front()(*this, ec);
-        m_pendingPushQueue.pop();
+        m_pendingPushQueue.pop(*this, ec);
     }
 
     // Выполняет отложенное извлечение.
     void doPendingPop(const boost::system::error_code& ec = {})
     {
-        m_pendingPopQueue.front()(*this, ec);
-        m_pendingPopQueue.pop();
+        m_pendingPopQueue.pop(*this, ec);
     }
 
     void checkInvariant() const
@@ -520,14 +533,10 @@ private:
     container_type m_queue;
 
     // Здесь хранятся ожидающие операции вставки, когда очередь переолнена.
-    std::queue<
-        detail::Function<void(Queue&, const boost::system::error_code&)>
-        > m_pendingPushQueue;
+    detail::FunctionQueue<void(Queue&, const boost::system::error_code&)> m_pendingPushQueue;
 
     // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
-    std::queue<
-        detail::Function<void(Queue&, const boost::system::error_code&)>
-        > m_pendingPopQueue;
+    detail::FunctionQueue<void(Queue&, const boost::system::error_code&)> m_pendingPopQueue;
 };
 
 
@@ -552,74 +561,6 @@ public:
 private:
     const Queue& m_self;
     std::lock_guard<std::recursive_mutex> m_lk;
-};
-
-
-// Отложенная операция извлечения.
-// В отличие от лямбды выставляет нужный нам метод get_allocator().
-template <typename Elem, typename Executor, typename Container>
-template <typename Handler>
-class Queue<Elem, Executor, Container>::PendingPopOp
-{
-public:
-    PendingPopOp(PendingPopOp&&) = default;
-
-    template <typename H>
-    PendingPopOp(H&& handler, boost::asio::executor_work_guard<executor_type>&& work)
-        : m_handler{ std::forward<H>(handler) }, m_work{ std::move(work) }
-    {
-    }
-
-    using allocator_type = boost::asio::associated_allocator_t<Handler>;
-    allocator_type get_allocator() const
-    {
-        return boost::asio::associated_allocator<Handler>::get(m_handler);
-    }
-
-    void operator()(Queue& self, const boost::system::error_code& ec)
-    {
-        if (ec) // Если отмена, то только уведомляем об отмене ожидающего извлечения.
-            self.completePop(optional<value_type>{}, std::move(m_handler), ec);
-        else // Иначе извлекаем как обычно.
-            self.doPop(std::move(m_handler));
-    }
-
-protected:
-    Handler m_handler;
-    // work нужен, чтобы функтор держал executor и предотвращал от выхода из run,
-    // пока отложенная операция не будет выполнена.
-    // В этот момент в очереди asio executor может быть и пусто,
-    // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
-    boost::asio::executor_work_guard<executor_type> m_work;
-};
-
-
-// Отложенная операция вставки.
-// В отличие от лямбды выставляет нужный нам метод get_allocator().
-// Отнаследован от PendingPopOp, чтобы не копипастить одно и то же, хранит все то же самое + value_type.
-template <typename Elem, typename Executor, typename Container>
-template <typename Handler>
-class Queue<Elem, Executor, Container>::PendingPushOp
-    : public PendingPopOp<Handler>
-{
-public:
-    template <typename U, typename H>
-    PendingPushOp(U&& val, H&& handler, boost::asio::executor_work_guard<executor_type>&& work)
-        : PendingPopOp<Handler>{ std::forward<H>(handler), std::move(work) }
-        , m_val{ std::forward<U>(val) }
-    {
-    }
-
-    void operator()(Queue& self, const boost::system::error_code& ec)
-    {
-        if (ec) // Если отмена, то только уведомляем об отмене ожидающей вставки.
-            self.completePush(std::move(this->m_handler), ec);
-        else // Иначе вставляем как обычно.
-            self.doPush(std::move(m_val), std::move(this->m_handler));
-    }
-
-private:
-    value_type m_val;
 };
 
 

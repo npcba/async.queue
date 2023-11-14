@@ -3,7 +3,8 @@
 #include <memory>
 #include <cassert>
 
-#include <boost/core/noncopyable.hpp>
+#include <boost/intrusive/slist.hpp>
+#include <boost/asio/associated_allocator.hpp>
 
 
 namespace ba {
@@ -24,39 +25,34 @@ namespace detail {
 // Барьер памяти между инициирующими операциями из параллельных потоков гарантируется мьютексами в Queue,
 // а между инициаторами и хендлерами барьер ставит asio::post. Поэтому явно его ставить не нужно.
 template <typename>
-class Function;
+class FunctionQueue;
 
 template <typename... Args>
-class Function<void(Args...)>
+class FunctionQueue<void(Args...)>
 {
 public:
-    // Умеет перемещаться.
-    Function(Function&&) = default;
-    Function& operator=(Function&&) = default;
+    FunctionQueue() = default;
+    FunctionQueue(FunctionQueue&&) = default;
+    FunctionQueue& operator=(FunctionQueue&&) = default;
 
-    // Не умеет копироваться.
-    Function(const Function&) = delete;
-    Function& operator=(const Function&) = delete;
-
-    // Отключены случайные перегрузки, т.к. в конструктор могут попасть универсальные ссылки,
-    // а нужны только rvalue-ref.
-    template <typename F, typename Alloc>
-    Function(F& f) = delete;
-    template <typename F, typename Alloc>
-    Function(const F& f) = delete;
-
-    // Инициализируется функтором по rvalue-ref и пользовательским аллокатором.
-    template <typename F>
-    Function(F&& f)
+    ~FunctionQueue()
     {
-        auto ha = Holder<F>::rebindAllocFrom(f);
+        assert(m_list.empty());
+        m_list.clear_and_dispose([](Node* node) { node->dispose(); });
+    }
+
+    template <typename F>
+    void push(F&& f)
+    {
+        using HolderType = Holder<std::decay_t<F>>;
+        auto ha = HolderType::rebindAllocFrom(f);
 
         // Проверим на всякий, что пользовательский аллокатор соответствует
         // как минимум equality requirements.
-        assert(Holder<F>::rebindAllocFrom(f) == ha);
+        assert(HolderType::rebindAllocFrom(f) == ha);
 
         // Выделяет память под холдер.
-        Holder<F>* holder = ha.allocate(1);
+        HolderType* holder = ha.allocate(1);
         // Стандартный аллокатор бросает исключение, нет гарантии, что пользовательский тоже,
         // приведём поведение к общему.
         if (!holder)
@@ -65,7 +61,7 @@ public:
         try
         {
             // Конструирует холдер на выделенной памяти.
-            new(holder) Holder<F>{ std::move(f) };
+            ::new(static_cast<void*>(holder)) HolderType{ std::forward<F>(f) };
         }
         catch (...)
         {
@@ -74,41 +70,45 @@ public:
             throw;
         }
 
-        m_callable.reset(holder);
+        m_list.push_back(*holder);
     }
 
-    // Пробрасывает вызов на внутренний объект
-    void operator()(Args... args)
+    void pop(Args... args)
     {
-        // Это первый и единственный вызов operator(),
-        // повторного вызова в данной библиотеке нет,
-        // а если случился, то выбрасывайте ее, хендлеры более 1 раза не вызываются в asio.
-        assert(m_callable);
+        assert(!m_list.empty());
+        Node& fn = m_list.front();
+        m_list.pop_front();
+        // После вызова звено самоуничтожится.
+        fn.disposableCall(std::forward<Args>(args)...);
+    }
 
-        m_callable->destructibleCallOp(std::forward<Args>(args)...);
-        // После вызова, холдер самоуничтожился, отпускаем unique_ptr.
-        m_callable.release();
+    bool empty() const noexcept
+    {
+        return m_list.empty();
     }
 
 private:
-    // Виртуальный интерфейс.
-    struct Callable
-        : boost::noncopyable
+    // Базовый класс для звена списка.
+    struct Node
+        : boost::intrusive::slist_base_hook<>
     {
+        Node() = default;
+        Node(const Node&) = delete;
+        Node& operator=(const Node&) = delete;
+
         // Удаление внутреннего состояния и вызов внутреннего operator() (см. детали ниже).
-        virtual void destructibleCallOp(Args... args) = 0;
-        // Удаление внутреннего состояния без вызова operator() (для деструктора).
-        virtual void destruct() = 0;
+        virtual void disposableCall(Args... args) = 0;
+        // Удаление внутреннего состояния без вызова operator() (вызывается из ~FunctionQueue()).
+        virtual void dispose() = 0;
     protected:
-        // Деструктор вызывать запрещено, удаление происходит методами выше.
-        ~Callable() = default;
+        // Деструктор извне недоступен, удаление происходит методами выше.
+        ~Node() = default;
     };
 
-    // Хранитель конкретного внутреннего состояния, параметризован пользовательским аллокатором,
-    // этим же аллокатором он и размещается в памяти.
+    // Хранитель конкретного внутреннего состояния.
     template <typename F>
     class Holder
-        : public Callable
+        : public Node
     {
     public:
         Holder(F&& f)
@@ -116,30 +116,35 @@ private:
         {
         }
 
-        void destructibleCallOp(Args... args) override
+        Holder(const F& f)
+            : m_f{ f }
         {
-            doDestruct()(std::forward<Args>(args)...);
         }
 
-        void destruct() override
+        void disposableCall(Args... args) override
         {
-            doDestruct();
+            destruct()(std::forward<Args>(args)...);
         }
 
-        static auto rebindAllocFrom(F& f)
+        void dispose() override
         {
-            // Возьмем get_allocator напрямую из функтора, это защитит от ошибок,
-            // если функтор случайно перестанет поддерживать get_allocator.
-            // А asio::get_associated_allocator незаметно откатывается в дефолт, нам такое не нужно.
-            auto a = f.get_allocator();
+            destruct();
+        }
+
+        static auto rebindAllocFrom(const F& f)
+        {
+            auto a = boost::asio::get_associated_allocator(f, std::allocator<F>{});
             // Ребиндит пользовательский аллокатор на тип холдера.
             typename std::allocator_traits<decltype(a)>::template rebind_alloc<Holder> ha{ a };
             return ha;
         }
 
     private:
-        // Перед удалением себя возвращает стековую копию внутреннего функтора (move-copy).
-        F doDestruct()
+        // Деструктор извне недоступен, удаление происходит через destruct().
+        ~Holder() = default;
+
+        // Перед удалением себя возвращает стековую копию внутреннего функтора (move-copy)
+        F destruct()
         {
             // Перемещает на стек функтор.
             F copyF = std::move(m_f);
@@ -156,16 +161,7 @@ private:
         F m_f;
     };
 
-    struct Deleter
-    {
-        void operator()(Callable* p) const
-        {
-            assert(p);
-            p->destruct();
-        };
-    };
-
-    std::unique_ptr<Callable, Deleter> m_callable;
+    boost::intrusive::slist<Node, boost::intrusive::cache_last<true>, boost::intrusive::constant_time_size<false>> m_list;
 };
 
 } // namespace detail

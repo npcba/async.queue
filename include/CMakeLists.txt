@@ -1,5 +1,6 @@
 file (GLOB_RECURSE HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/async/*.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/memory_resource/*.hpp
 )
 
 add_library (

@@ -1,6 +1,9 @@
 #pragma once
 
+#include "compressed_pair.hpp"
+
 #include <type_traits>
+#include <utility>
 
 #include <boost/asio/associated_allocator.hpp>
 
@@ -10,33 +13,48 @@ namespace detail {
 
 template <typename F, typename FirstArg>
 class AssociatedBinder
-    : private FirstArg
 {
 public:
     template <typename F_, typename FirstArg_>
     AssociatedBinder(F_&& f, FirstArg_&& firstArg)
-        : FirstArg{ std::forward<FirstArg_>(firstArg) }, m_f{ std::forward<F_>(f) }
+        : m_pair{ std::forward<FirstArg_>(firstArg), std::forward<F_>(f) }
     {
     }
-    
+
+    template <typename... RestArgs>
+    auto operator()(RestArgs&&... restArgs) const
+    {
+        return getF().operator()(getFirstArg(), std::forward<RestArgs>(restArgs)...);
+    }
+
     template <typename... RestArgs>
     auto operator()(RestArgs&&... restArgs)
     {
-        return m_f(static_cast<FirstArg&>(*this), std::forward<RestArgs>(restArgs)...);
+        return getF().operator()(getFirstArg(), std::forward<RestArgs>(restArgs)...);
+    }
+
+    const F& getF() const noexcept
+    {
+        return m_pair.getSolid();
+    }
+
+    F& getF() noexcept
+    {
+        return m_pair.getSolid();
     }
 
     const FirstArg& getFirstArg() const noexcept
     {
-        return *this;
+        return m_pair.getEmpty();
     }
 
     FirstArg& getFirstArg() noexcept
     {
-        return *this;
+        return m_pair.getEmpty();
     }
 
 private:
-    F m_f;
+    CompressedPair<FirstArg, F> m_pair;
 };
 
 template <typename F, typename FirstArg>

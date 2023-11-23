@@ -1,8 +1,8 @@
 #pragma once
 
-#include "detail/function_queue.hpp"
-#include "detail/check_callable.hpp"
-#include "detail/associated_binder.hpp"
+#include "queue/detail/function_queue.hpp"
+#include "queue/detail/check_callable.hpp"
+#include "queue/detail/associated_binder.hpp"
 
 #include <type_traits>
 #include <queue>
@@ -37,10 +37,10 @@ namespace async {
 
 #if defined(BA_ASYNC_USE_BOOST_OPTIONAL) || !defined(__cpp_lib_optional)
     template <typename T>
-    using optional = boost::optional<T>;
+    using Optional = boost::optional<T>;
 #else
     template <typename T>
-    using optional = std::optional<T>;
+    using Optional = std::optional<T>;
 #endif
 
 
@@ -52,6 +52,7 @@ namespace async {
 template <
       typename Elem
     , typename Executor = boost::asio::executor
+    , typename HandlerDefaultAllocator = std::allocator<unsigned char>
     , typename Container = std::queue<Elem>
     >
 class Queue
@@ -69,9 +70,14 @@ public:
      * В некоторых случаях в процессе работы Container может заполняться до размера limit + 1,
      * но снаружи этого не заметно, важно, чтобы пользовательский Container допускал такой размер.
      */
-    explicit Queue(const executor_type& ex, std::size_t limit)
+    explicit Queue(
+          const executor_type& ex
+        , std::size_t limit
+        , const HandlerDefaultAllocator& handlerDefAlloc = HandlerDefaultAllocator{}
+        )
         : m_ex{ ex }
         , m_limit{ limit }
+        , m_pendingQueue{ handlerDefAlloc }
     {
         checkInvariant();
     }
@@ -85,11 +91,12 @@ public:
     explicit Queue(
           ExecutionContext& context
         , std::size_t limit
+        , const HandlerDefaultAllocator& handlerDefAlloc = HandlerDefaultAllocator{}
         , typename std::enable_if_t<
             std::is_convertible<ExecutionContext&, boost::asio::execution_context&>::value
             >* = 0
         )
-        : Queue{ context.get_executor(), limit }
+        : Queue{ context.get_executor(), limit, handlerDefAlloc }
     {
     }
 
@@ -106,6 +113,9 @@ public:
     /// Перемещаться умеет
     Queue& operator=(Queue&& other)
     {
+        if (this == &other)
+            return *this;
+
         // Хоть и трудно себе представить deadlock в данном случае, на всякий 2 мьютекса лочатся атомарно.
         std::unique_lock<std::recursive_mutex> lkThis{ m_mutex, std::defer_lock };
         std::unique_lock<std::recursive_mutex> lkOther{ other.m_mutex, std::defer_lock };
@@ -119,8 +129,8 @@ public:
         m_ex = other.m_ex;
         m_limit = other.m_limit;
         m_queue = std::move(other.m_queue);
-        m_pendingPushQueue = std::move(other.m_pendingPushQueue);
-        m_pendingPopQueue = std::move(other.m_pendingPopQueue);
+        m_pendingQueue = std::move(other.m_pendingQueue);
+        m_noPendingPush = other.m_noPendingPush;
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -183,13 +193,13 @@ public:
      * @param token должен порождать хендлер или быть хендлером с сигнатурой:
      * @code void handler(
      *       const boost::system::error_code& error // результат операции
-     *     , optional<Elem> value // извлеченное значение
+     *     , Optional<Elem> value // извлеченное значение
      * ); @endcode
      * :)
      * Если очередь пуста, извлечение элемента и вызов handler произойдет
      * после очередного вызова @ref asyncPush.
      * При отмене ожидаемой операции error == boost::asio::error::operation_aborted и
-     * value == optional<Elem>{}
+     * value == Optional<Elem>{}
      */
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
@@ -200,13 +210,13 @@ public:
         // Вместо этого мьютекс лочится в initPop.
 
 #if BOOST_VERSION >= 107000
-        return boost::asio::async_initiate<PopToken, void(boost::system::error_code, optional<value_type>)>(
+        return boost::asio::async_initiate<PopToken, void(boost::system::error_code, Optional<value_type>)>(
             AsyncInit{ *this }, token
             );
 #else
         boost::asio::async_completion<
               PopToken
-            , void(boost::system::error_code, optional<value_type>)
+            , void(boost::system::error_code, Optional<value_type>)
             > init{ token };
 
         initPop(init.completion_handler);
@@ -251,7 +261,7 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        if (m_pendingPushQueue.empty())
+        if (!hasPendingPush())
             return 0;
 
         doPendingPush(boost::asio::error::operation_aborted);
@@ -268,6 +278,7 @@ public:
         while (cancelOnePush())
             ++n;
 
+        assert(!hasPendingPush());
         return n;
     }
 
@@ -276,7 +287,7 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        if (m_pendingPopQueue.empty())
+        if (!hasPendingPop())
             return 0;
 
         doPendingPop(boost::asio::error::operation_aborted);
@@ -293,6 +304,7 @@ public:
         while (cancelOnePop())
             ++n;
 
+        assert(!hasPendingPop());
         return n;
     }
 
@@ -331,9 +343,19 @@ private:
         : m_ex{ other.m_ex } // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
         , m_limit{ other.m_limit }
         , m_queue{ std::move(other.m_queue) }
-        , m_pendingPushQueue{ std::move(other.m_pendingPushQueue) }
-        , m_pendingPopQueue{ std::move(other.m_pendingPopQueue) }
+        , m_pendingQueue{ std::move(other.m_pendingQueue) }
+        , m_noPendingPush{ other.m_noPendingPush }
     {
+    }
+
+    bool hasPendingPush() const noexcept
+    {
+        return !m_noPendingPush && !m_pendingQueue.empty();
+    }
+
+    bool hasPendingPop() const noexcept
+    {
+        return m_noPendingPush && !m_pendingQueue.empty();
     }
 
     // Инициатор вставки.
@@ -353,13 +375,13 @@ private:
         LockGuard lkGuard{ *this };
 
         // Если лимит не превышен или есть ожидающие извлечения, то вставляем, иначе откладываем.
-        if (m_queue.size() < m_limit || !m_pendingPopQueue.empty())
+        if (m_queue.size() < m_limit || hasPendingPop())
             doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
         else
             deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
 
         // Если есть ожидающие извлечения, выполняем извлечение.
-        if (!m_pendingPopQueue.empty())
+        if (hasPendingPop())
         {
             // Если ждали извлечения, значит до этого уперлись в size == 0, и теперь он стал равен 1.
             // При m_limit == 0, в очереди кратковременно появится 1 элемент, но снаружи это не заметно.
@@ -376,16 +398,16 @@ private:
         static_assert(
             ba::async::detail::CheckCallable<
                   decltype(handler)
-                , void(const boost::system::error_code&, optional<value_type>)
+                , void(const boost::system::error_code&, Optional<value_type>)
                 >::value
-            , "Handler signature must be 'void(const boost::system::error_code&, optional<Elem>)'"
+            , "Handler signature must be 'void(const boost::system::error_code&, Optional<Elem>)'"
             );
 
         // Именно тут блокируемся, а не в asyncPop.
         LockGuard lkGuard{ *this };
 
         // Если есть ождающие вставки, то вставляем.
-        if (!m_pendingPushQueue.empty())
+        if (hasPendingPush())
         {
             doPendingPush();
             // Если ждали вставки, значит до этого уперлись в лимит,
@@ -415,7 +437,7 @@ private:
     // Комплитер извлечения.
     template <typename PopHandler>
     void completePop(
-          optional<value_type>&& val
+          Optional<value_type>&& val
         , PopHandler&& handler
         , const boost::system::error_code& ec = {}
         )
@@ -434,7 +456,7 @@ private:
         boost::asio::detail::move_binder2<
               std::decay_t<PopHandler>
             , boost::system::error_code
-            , optional<value_type>
+            , Optional<value_type>
             > binder{
                   0
                 , std::move(handlerCopy)
@@ -451,6 +473,7 @@ private:
     template <typename U, typename PushHandler>
     void doPush(U&& val, PushHandler&& handler)
     {
+        assert(m_queue.size() <= m_limit);
         m_queue.emplace(std::forward<U>(val));
         completePush(std::forward<PushHandler>(handler), boost::system::error_code{});
     }
@@ -459,6 +482,7 @@ private:
     template <typename PopHandler>
     void doPop(PopHandler&& handler)
     {
+        assert(!m_queue.empty());
         completePop(std::move(m_queue.front()), std::forward<PopHandler>(handler), boost::system::error_code{});
         m_queue.pop();
     }
@@ -466,13 +490,15 @@ private:
     template <typename Handler, typename U>
     void deferPush(Handler&& handler, U&& val)
     {
+        assert(!hasPendingPop());
+
         // work нужен, чтобы функтор держал executor и предотвращал от выхода из run,
         // пока отложенная операция не будет выполнена.
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
 
-        m_pendingPushQueue.push(detail::bindAssociated(
+        m_pendingQueue.push(detail::bindAssociated(
             [val{ value_type(std::forward<U>(val)) }, work{ std::move(work) }]
             (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
@@ -483,47 +509,59 @@ private:
             }
             , std::move(handler))
         );
+        m_noPendingPush = false;
+
+        assert(!hasPendingPop() && hasPendingPush());
     }
 
     template <typename Handler>
     void deferPop(Handler&& handler)
     {
+        assert(!hasPendingPush());
+
         // work нужен, чтобы функтор держал executor и предотвращал от выхода из run,
         // пока отложенная операция не будет выполнена.
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto work = boost::asio::make_work_guard(m_ex);
 
-        m_pendingPopQueue.push(detail::bindAssociated(
+        m_pendingQueue.push(detail::bindAssociated(
             [work{ std::move(work) }]
             (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 if (ec) // Если отмена, то только уведомляем об отмене ожидающего извлечения.
-                    self.completePop(optional<value_type>{}, std::move(h), ec);
+                    self.completePop(Optional<value_type>{}, std::move(h), ec);
                 else // Иначе извлекаем как обычно.
                     self.doPop(std::move(h));
             }
             , std::move(handler))
             );
+        m_noPendingPush = true;
+
+        assert(!hasPendingPush() && hasPendingPop());
     }
 
     // Выполняет отложенную вставку.
     void doPendingPush(const boost::system::error_code& ec = {})
     {
-        m_pendingPushQueue.pop(*this, ec);
+        assert(hasPendingPush() && !hasPendingPop());
+        m_pendingQueue.pop(*this, ec);
+        assert(!hasPendingPop());
     }
 
     // Выполняет отложенное извлечение.
     void doPendingPop(const boost::system::error_code& ec = {})
     {
-        m_pendingPopQueue.pop(*this, ec);
+        assert(hasPendingPop() && !hasPendingPush());
+        m_pendingQueue.pop(*this, ec);
+        assert(!hasPendingPush());
     }
 
     void checkInvariant() const
     {
         assert(m_queue.size() <= m_limit);
-        assert(m_queue.empty() || m_pendingPopQueue.empty());
-        assert(m_queue.size() == m_limit || m_pendingPushQueue.empty());
+        assert(m_queue.size() == m_limit || !hasPendingPush());
+        assert(m_queue.empty() || !hasPendingPop());
     }
 
 private:
@@ -533,17 +571,15 @@ private:
     container_type m_queue;
 
     // Здесь хранятся ожидающие операции вставки, когда очередь переолнена.
-    detail::FunctionQueue<void(Queue&, const boost::system::error_code&)> m_pendingPushQueue;
-
-    // Здесь хранятся ожидающие операции извлечения, когда очередь пуста.
-    detail::FunctionQueue<void(Queue&, const boost::system::error_code&)> m_pendingPopQueue;
+    detail::FunctionQueue<void(Queue&, const boost::system::error_code&), HandlerDefaultAllocator> m_pendingQueue;
+    bool m_noPendingPush = false;
 };
 
 
 // Обертка над std::unique_lock.
 // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
-template <typename Elem, typename Executor, typename Container>
-class Queue<Elem, Executor, Container>::LockGuard
+template <typename Elem, typename Executor, typename HandlerDefaultAllocator, typename Container>
+class Queue<Elem, Executor, HandlerDefaultAllocator, Container>::LockGuard
     : boost::noncopyable
 {
 public:
@@ -567,8 +603,8 @@ private:
 #if BOOST_VERSION >= 107000
 // Обертка-функтор для asio::async_initiate, чтобы не городить лямбду
 // и выставить из нее get_executor() непонятно зачем.
-template <typename Elem, typename Executor, typename Container>
-class Queue<Elem, Executor, Container>::AsyncInit
+template <typename Elem, typename Executor, typename HandlerDefaultAllocator, typename Container>
+class Queue<Elem, Executor, HandlerDefaultAllocator, Container>::AsyncInit
 {
 public:
     // В документации asio::async_initiate ничего не сказано о возможной поддержке

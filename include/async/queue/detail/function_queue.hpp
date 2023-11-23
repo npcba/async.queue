@@ -1,5 +1,7 @@
 #pragma once
 
+#include "compressed_pair.hpp"
+
 #include <memory>
 #include <cassert>
 
@@ -24,32 +26,50 @@ namespace detail {
 // удалением его из динамической памяти и вызовом стековой копии.
 // Барьер памяти между инициирующими операциями из параллельных потоков гарантируется мьютексами в Queue,
 // а между инициаторами и хендлерами барьер ставит asio::post. Поэтому явно его ставить не нужно.
-template <typename>
+template <typename Signature, typename DefautlAllocator>
 class FunctionQueue;
 
-template <typename... Args>
-class FunctionQueue<void(Args...)>
+template <typename... Args, typename DefaultAllocator>
+class FunctionQueue<void(Args...), DefaultAllocator>
 {
 public:
-    FunctionQueue() = default;
-    FunctionQueue(FunctionQueue&&) = default;
-    FunctionQueue& operator=(FunctionQueue&&) = default;
-
-    ~FunctionQueue()
+    explicit FunctionQueue(const DefaultAllocator& defAlloc = DefaultAllocator{})
+        : m_data{ defAlloc, ListType{} }
     {
-        assert(m_list.empty());
-        m_list.clear_and_dispose([](Node* node) { node->dispose(); });
+    }
+
+    FunctionQueue(FunctionQueue&&) = default;
+
+    FunctionQueue& operator=(FunctionQueue&& other) noexcept
+    {
+        static_assert(std::is_move_assignable<DefaultAllocator>::value, "DefaultAllocator is not move-assignable. Use PhoenixAssignableAdaptor<DefaultAllocator> if you want it.");
+
+        if (this == &other)
+            return *this;
+
+        // Сначала нужно почистить старым аллокатором.
+        clear();
+        // Только потом присваивать новый список с новым аллокатором.
+        m_data = std::move(other.m_data);
+        assert(other.getList().empty());
+
+        return *this;
+    }
+
+    ~FunctionQueue() noexcept
+    {
+        clear();
     }
 
     template <typename F>
     void push(F&& f)
     {
         using HolderType = Holder<std::decay_t<F>>;
-        auto ha = HolderType::rebindAllocFrom(f);
+        auto ha = HolderType::rebindAllocFrom(f, getDefAlloc());
 
         // Проверим на всякий, что пользовательский аллокатор соответствует
         // как минимум equality requirements.
-        assert(HolderType::rebindAllocFrom(f) == ha);
+        assert(HolderType::rebindAllocFrom(f, getDefAlloc()) == ha);
 
         // Выделяет память под холдер.
         HolderType* holder = ha.allocate(1);
@@ -70,21 +90,21 @@ public:
             throw;
         }
 
-        m_list.push_back(*holder);
+        getList().push_back(*holder);
     }
 
     void pop(Args... args)
     {
-        assert(!m_list.empty());
-        Node& fn = m_list.front();
-        m_list.pop_front();
+        assert(!getList().empty());
+        Node& fn = getList().front();
+        getList().pop_front();
         // После вызова звено самоуничтожится.
-        fn.disposableCall(std::forward<Args>(args)...);
+        fn.disposableCall(getDefAlloc(), std::forward<Args>(args)...);
     }
 
     bool empty() const noexcept
     {
-        return m_list.empty();
+        return getList().empty();
     }
 
 private:
@@ -97,9 +117,9 @@ private:
         Node& operator=(const Node&) = delete;
 
         // Удаление внутреннего состояния и вызов внутреннего operator() (см. детали ниже).
-        virtual void disposableCall(Args... args) = 0;
+        virtual void disposableCall(const DefaultAllocator& defAlloc, Args... args) = 0;
         // Удаление внутреннего состояния без вызова operator() (вызывается из ~FunctionQueue()).
-        virtual void dispose() = 0;
+        virtual void dispose(const DefaultAllocator& defAlloc) = 0;
     protected:
         // Деструктор извне недоступен, удаление происходит методами выше.
         ~Node() = default;
@@ -121,19 +141,19 @@ private:
         {
         }
 
-        void disposableCall(Args... args) override
+        void disposableCall(const DefaultAllocator& defAlloc, Args... args) override
         {
-            destruct()(std::forward<Args>(args)...);
+            destruct(defAlloc)(std::forward<Args>(args)...);
         }
 
-        void dispose() override
+        void dispose(const DefaultAllocator& defAlloc) override
         {
-            destruct();
+            destruct(defAlloc);
         }
 
-        static auto rebindAllocFrom(const F& f)
+        static auto rebindAllocFrom(const F& f, const DefaultAllocator& defAlloc)
         {
-            auto a = boost::asio::get_associated_allocator(f, std::allocator<F>{});
+            auto a = boost::asio::get_associated_allocator(f, defAlloc);
             // Ребиндит пользовательский аллокатор на тип холдера.
             typename std::allocator_traits<decltype(a)>::template rebind_alloc<Holder> ha{ a };
             return ha;
@@ -144,7 +164,7 @@ private:
         ~Holder() = default;
 
         // Перед удалением себя возвращает стековую копию внутреннего функтора (move-copy)
-        F destruct()
+        F destruct(const DefaultAllocator& defAlloc)
         {
             // Перемещает на стек функтор.
             F copyF = std::move(m_f);
@@ -152,7 +172,7 @@ private:
             // Деструктит себя.
             this->~Holder();
             // Освобождает аллокатором память из-под себя.
-            rebindAllocFrom(copyF).deallocate(this, 1);
+            rebindAllocFrom(copyF, defAlloc).deallocate(this, 1);
 
             // Возвращает копию функтора (аллокатор больше не нужен).
             return copyF;
@@ -161,7 +181,33 @@ private:
         F m_f;
     };
 
-    boost::intrusive::slist<Node, boost::intrusive::cache_last<true>, boost::intrusive::constant_time_size<false>> m_list;
+private:
+    using ListType = boost::intrusive::slist<Node, boost::intrusive::cache_last<true>, boost::intrusive::constant_time_size<false>>;
+
+    // clear сделан для успокоения совести для надежности деструктора,
+    // охватывающий класс Queue всегда отменяет очередь отложенных операций в своем деструкторе или operaror=.
+    void clear() noexcept
+    {
+        assert(getList().empty());
+        getList().clear_and_dispose([&alloc{ getDefAlloc() }](Node* node) { node->dispose(alloc); });
+    }
+
+    ListType& getList() noexcept
+    {
+        return m_data.getSolid();
+    }
+
+    const ListType& getList() const noexcept
+    {
+        return m_data.getSolid();
+    }
+
+    DefaultAllocator& getDefAlloc() noexcept
+    {
+        return m_data.getEmpty();
+    }
+
+    CompressedPair<DefaultAllocator, ListType> m_data;
 };
 
 } // namespace detail

@@ -1,6 +1,6 @@
 #define BOOST_TEST_MODULE LibAsync
 
-#include <async/queue/queue.hpp>
+#include <async/queue.hpp>
 
 #include <thread>
 #include <atomic>
@@ -46,7 +46,7 @@ BOOST_AUTO_TEST_CASE(strandTest)
         BOOST_CHECK(s1.running_in_this_thread());
         }));
 
-    q0.asyncPop(boost::asio::bind_executor(s1, [s1](boost::system::error_code ec, ba::async::optional<int> val) {
+    q0.asyncPop(boost::asio::bind_executor(s1, [s1](boost::system::error_code ec, ba::async::Optional<int> val) {
         BOOST_CHECK(s1.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         }));
@@ -57,7 +57,7 @@ BOOST_AUTO_TEST_CASE(strandTest)
         BOOST_CHECK(s2.running_in_this_thread());
         }));
 
-    q0.asyncPop(s2.wrap([s2](boost::system::error_code ec, ba::async::optional<int> val) {
+    q0.asyncPop(s2.wrap([s2](boost::system::error_code ec, ba::async::Optional<int> val) {
         BOOST_CHECK(s2.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         }));
@@ -67,7 +67,7 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q1{ s1, 10 };
 
-    q1.asyncPop([s1](boost::system::error_code ec, ba::async::optional<int> val) {
+    q1.asyncPop([s1](boost::system::error_code ec, ba::async::Optional<int> val) {
         BOOST_CHECK(s1.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         });
@@ -81,7 +81,7 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q2{ s2, 10 };
 
-    q2.asyncPop([s2](boost::system::error_code ec, ba::async::optional<int> val) {
+    q2.asyncPop([s2](boost::system::error_code ec, ba::async::Optional<int> val) {
         BOOST_CHECK(s2.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         });
@@ -109,7 +109,7 @@ BOOST_AUTO_TEST_CASE(futureTest)
     boost::asio::io_context ioc;
     ba::async::Queue<int> q{ ioc, 1 };
 
-    std::future<ba::async::optional<int>> fPop = q.asyncPop(boost::asio::use_future);
+    std::future<ba::async::Optional<int>> fPop = q.asyncPop(boost::asio::use_future);
     std::future<void> fPush = q.asyncPush(123, boost::asio::use_future);
 
     ThreadPool{ ioc, 10 }.join();
@@ -120,7 +120,7 @@ BOOST_AUTO_TEST_CASE(futureTest)
     BOOST_CHECK_EQUAL(0, q.cancel());
 
 
-    std::future<ba::async::optional<int>> fPopUnderflow = q.asyncPop(boost::asio::use_future);
+    std::future<ba::async::Optional<int>> fPopUnderflow = q.asyncPop(boost::asio::use_future);
     BOOST_CHECK_EQUAL(1, q.cancel());
 
     fPush = q.asyncPush(123, boost::asio::use_future);
@@ -247,7 +247,7 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
     ba::async::Queue<Movable> q{ ioc, 10 };
 
     q.asyncPush(Movable{}, [](boost::system::error_code) {});
-    q.asyncPop([](boost::system::error_code, ba::async::optional<Movable> val) {});
+    q.asyncPop([](boost::system::error_code, ba::async::Optional<Movable> val) {});
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         q.asyncPush(Movable{}, yield);
@@ -258,12 +258,12 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
     });
 
     std::future<void> fPush = q.asyncPush(Movable{}, boost::asio::use_future);
-    std::future<ba::async::optional<Movable>> fPop = q.asyncPop(boost::asio::use_future);
+    std::future<ba::async::Optional<Movable>> fPop = q.asyncPop(boost::asio::use_future);
 
     ThreadPool{ ioc, 4 }.join();
 
     fPush.get();
-    ba::async::optional<Movable> val = fPop.get();
+    ba::async::Optional<Movable> val = fPop.get();
 }
 
 #if BOOST_VERSION >= 107000
@@ -281,7 +281,7 @@ BOOST_AUTO_TEST_CASE(moveHandlerTest)
         MovableHandler(const MovableHandler&) = delete;
 
         void operator()(boost::system::error_code) const {}
-        void operator()(boost::system::error_code, ba::async::optional<int>) const {}
+        void operator()(boost::system::error_code, ba::async::Optional<int>) const {}
     };
 
     boost::asio::io_context ioc;
@@ -314,11 +314,11 @@ BOOST_AUTO_TEST_CASE(moveQueueTest)
     q1.asyncPush(4, [](boost::system::error_code) {});
     q1.asyncPush(5, [](boost::system::error_code) {});
 
-    q1.asyncPop([&q1, &q2](boost::system::error_code, ba::async::optional<int>) mutable {
+    q1.asyncPop([&q1, &q2](boost::system::error_code, ba::async::Optional<int>) mutable {
         q2 = std::move(q1);
     });
 
-    q1.asyncPop([&q2, &q3](boost::system::error_code, ba::async::optional<int>) mutable {
+    q1.asyncPop([&q2, &q3](boost::system::error_code, ba::async::Optional<int>) mutable {
         // Делаем именно в хендлере, что бы поймать состояние полной очереди и ожидающей операции вставки.
         // После ThreadPool::join нельзя, он зависнет на ожидающей операции вставки.
 
@@ -404,9 +404,9 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
             auto e = ec;
         }
 
-        void operator()(boost::system::error_code ec, ba::async::optional<int>)
+        void operator()(boost::system::error_code ec, ba::async::Optional<int>)
         {
-            //std::cout << std::this_thread::get_id() << ": void operator()(boost::system::error_code ec, ba::async::optional<int>)" << std::endl << std::endl << std::flush;
+            //std::cout << std::this_thread::get_id() << ": void operator()(boost::system::error_code ec, ba::async::Optional<int>)" << std::endl << std::endl << std::flush;
             auto e = ec;
         }
     };
@@ -415,7 +415,9 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
     ba::async::Queue<int> q{ ioc, 0 };
     ioc.post([&q]{
         q.asyncPush(1, Handler{});
+        std::thread([&q] {
         q.asyncPop(Handler{});
+        }).join();
     });
 
     ThreadPool(ioc, 10).join();

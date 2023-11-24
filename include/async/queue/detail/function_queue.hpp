@@ -14,9 +14,10 @@ namespace async {
 namespace detail {
 
 
-// Movable-only замена std::function для полиморфного хранения разнотипных хендлеров.
-// Возвращает только void, ибо в данной библиотеке другого не нужно (добавить не сложно).
-// Для распределения внутреннего состояния использует пользовательский аллокатор (для поддержки asio).
+// Односвязный список для полиморфного хранения разнотипных функций с общей сигнатурой.
+// Сигнатура с возвращаемым значением только void, ибо в данной библиотеке другого не нужно (добавить не сложно).
+// Для распределения внутреннего состояния используется пользовательский аллокатор (для поддержки asio).
+// Если пользовательская функция не имеет ассоциированного аллокатора, то будет использован DefaultAllocator.
 // operator() вызывает внутренний объект и сразу разрушает его(повторный вызов запрещен,
 // в данной библиотеке он и невозможен).
 // Asio гарантирует своим пользователям, что allocator.deallocate будет вызван строго до вызова хендлера,
@@ -42,7 +43,10 @@ public:
 
     FunctionQueue& operator=(FunctionQueue&& other) noexcept
     {
-        static_assert(std::is_move_assignable<DefaultAllocator>::value, "DefaultAllocator is not move-assignable. Use PhoenixAssignableAdaptor<DefaultAllocator> if you want it.");
+        static_assert(
+              std::is_move_assignable<DefaultAllocator>::value
+            , "DefaultAllocator is not move-assignable. Use AssignableAllocatorWrapper<DefaultAllocator> if you want it."
+            );
 
         if (this == &other)
             return *this;
@@ -93,11 +97,14 @@ public:
         getList().push_back(*holder);
     }
 
+    // Убирает функцию из начала очереди и вызывает одноразовый operator().
     void pop(Args... args)
     {
         assert(!getList().empty());
+
         Node& fn = getList().front();
         getList().pop_front();
+
         // После вызова звено самоуничтожится.
         fn.disposableCall(getDefAlloc(), std::forward<Args>(args)...);
     }
@@ -109,6 +116,7 @@ public:
 
 private:
     // Базовый класс для звена списка.
+    // Содержит управляющие структуры типа указателя на следующее звено в slist_base_hook
     struct Node
         : boost::intrusive::slist_base_hook<>
     {
@@ -118,14 +126,14 @@ private:
 
         // Удаление внутреннего состояния и вызов внутреннего operator() (см. детали ниже).
         virtual void disposableCall(const DefaultAllocator& defAlloc, Args... args) = 0;
-        // Удаление внутреннего состояния без вызова operator() (вызывается из ~FunctionQueue()).
+        // Удаление внутреннего состояния без вызова operator() (вызывается из clear()).
         virtual void dispose(const DefaultAllocator& defAlloc) = 0;
     protected:
         // Деструктор извне недоступен, удаление происходит методами выше.
         ~Node() = default;
     };
 
-    // Хранитель конкретного внутреннего состояния.
+    // Хранитель реального типа функции, вставляемой в список.
     template <typename F>
     class Holder
         : public Node
@@ -151,8 +159,10 @@ private:
             destruct(defAlloc);
         }
 
-        static auto rebindAllocFrom(const F& f, const DefaultAllocator& defAlloc)
+        // Возвращает аллокатор ассоциированный с f, и сразу перепривязанный на тип Holder.
+        static auto rebindAllocFrom(const F& f, const DefaultAllocator& defAlloc) noexcept
         {
+            // Получает ассоциированный аллокатор (если нет его, то дефолтный).
             auto a = boost::asio::get_associated_allocator(f, defAlloc);
             // Ребиндит пользовательский аллокатор на тип холдера.
             typename std::allocator_traits<decltype(a)>::template rebind_alloc<Holder> ha{ a };
@@ -163,7 +173,7 @@ private:
         // Деструктор извне недоступен, удаление происходит через destruct().
         ~Holder() = default;
 
-        // Перед удалением себя возвращает стековую копию внутреннего функтора (move-copy)
+        // Перед удалением себя возвращает стековую копию внутреннего функтора (move-copy).
         F destruct(const DefaultAllocator& defAlloc)
         {
             // Перемещает на стек функтор.
@@ -172,24 +182,40 @@ private:
             // Деструктит себя.
             this->~Holder();
             // Освобождает аллокатором память из-под себя.
+            // Аллокатор здесь не хранится, вычисляем его так же, как и при выделении памяти,
+            // ведь rebindAllocFrom должен возвращать эквивалентные аллокаторы.
             rebindAllocFrom(copyF, defAlloc).deallocate(this, 1);
 
             // Возвращает копию функтора (аллокатор больше не нужен).
             return copyF;
         }
 
+    private:
         F m_f;
     };
 
 private:
-    using ListType = boost::intrusive::slist<Node, boost::intrusive::cache_last<true>, boost::intrusive::constant_time_size<false>>;
+    // В качестве списка используется boost::intrusive::slist, который не выделяет динамической памяти.
+    // Все нужные управляющие структуры содержатся в Node, поэтому память под них и Holder выделяется одним куском.
+    // Это позволяет гарантировать пользователю, что любые динамические данные связанные
+    // с конкретным пользовательским хендлером размещаются его же аллокатором.
+    using ListType = boost::intrusive::slist<
+          Node
+        , boost::intrusive::cache_last<true>
+        , boost::intrusive::constant_time_size<false>
+        >;
 
-    // clear сделан для успокоения совести для надежности деструктора,
+    // clear сделан для успокоения совести для надежности деструктора и operaror=,
     // охватывающий класс Queue всегда отменяет очередь отложенных операций в своем деструкторе или operaror=.
     void clear() noexcept
     {
         assert(getList().empty());
-        getList().clear_and_dispose([&alloc{ getDefAlloc() }](Node* node) { node->dispose(alloc); });
+
+        auto disposer = [&alloc{ getDefAlloc() }](Node* node) {
+            node->dispose(alloc);
+        };
+
+        getList().clear_and_dispose(disposer);
     }
 
     ListType& getList() noexcept
@@ -207,6 +233,7 @@ private:
         return m_data.getEmpty();
     }
 
+    // Сжимаем аллокатор, зачастую он без состояния.
     CompressedPair<DefaultAllocator, ListType> m_data;
 };
 

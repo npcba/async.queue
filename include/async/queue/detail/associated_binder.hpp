@@ -11,6 +11,13 @@ namespace ba {
 namespace async {
 namespace detail {
 
+// Связывает первый аргумент FirstArg функции F.
+// Похоже на std::bind1st, но дополнительно для биндера сделана специализация boost::asio::associated_allocator (см. ниже).
+// Это позволяет писать лямбды, в которые захватываются хендлеры и не терять при этом возможности получать
+// ассоциировнный с хендлером аллокатор через boost::asio::associated_allocator.
+//
+// F - лямбда, FirstArg - первым аргументом должен быть хендлер.
+// Проксирует запрос ассоциированного аллокатора к FirstArg.
 template <typename F, typename FirstArg>
 class AssociatedBinder
 {
@@ -24,13 +31,13 @@ public:
     template <typename... RestArgs>
     auto operator()(RestArgs&&... restArgs) const
     {
-        return getF().operator()(getFirstArg(), std::forward<RestArgs>(restArgs)...);
+        return getF()(getFirstArg(), std::forward<RestArgs>(restArgs)...);
     }
 
     template <typename... RestArgs>
     auto operator()(RestArgs&&... restArgs)
     {
-        return getF().operator()(getFirstArg(), std::forward<RestArgs>(restArgs)...);
+        return getF()(getFirstArg(), std::forward<RestArgs>(restArgs)...);
     }
 
     const F& getF() const noexcept
@@ -54,6 +61,7 @@ public:
     }
 
 private:
+    // Сжимаем FirstArg, в данной библиотеке это пользовательский хендлер. Зачастую бывает без состояния.
     CompressedPair<FirstArg, F> m_pair;
 };
 
@@ -68,13 +76,20 @@ AssociatedBinder<std::decay_t<F>, std::decay_t<FirstArg>> bindAssociated(F&& f, 
 } // namespace ba
 
 
+// Специализация boost::asio::associated_allocator для AssociatedBinder.
+// Проксирует запрос ассоциированного аллокатора к FirstArg.
 template <typename F, typename FirstArg, typename Allocator>
-struct boost::asio::associated_allocator<ba::async::detail::AssociatedBinder<F, FirstArg>, Allocator>
+struct boost::asio::associated_allocator<
+      ba::async::detail::AssociatedBinder<F, FirstArg>
+    , Allocator
+    >
 {
     using type = boost::asio::associated_allocator_t<FirstArg, Allocator>;
 
-    static type get(const ba::async::detail::AssociatedBinder<F, FirstArg>& b,
-        const Allocator& a = Allocator{}) noexcept
+    static type get(
+          const ba::async::detail::AssociatedBinder<F, FirstArg>& b
+        , const Allocator& a = Allocator{}
+        ) noexcept
     {
         return boost::asio::associated_allocator<FirstArg, Allocator>::get(b.getFirstArg(), a);
     }

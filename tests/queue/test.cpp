@@ -281,7 +281,8 @@ BOOST_AUTO_TEST_CASE(moveHandlerTest)
         MovableHandler(const MovableHandler&) = delete;
 
         void operator()(boost::system::error_code) const {}
-        void operator()(boost::system::error_code, ba::async::Optional<int>) const {}
+        void operator()(boost::system::error_code, int) const {}
+        void operator()(boost::system::error_code, ba::async::NullOptT) const {}
     };
 
     boost::asio::io_context ioc;

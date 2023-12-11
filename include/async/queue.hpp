@@ -194,7 +194,6 @@ public:
     /// Асинхронно извлекает элемент и по завершению исполняет хендлер,
     /// порожденный от token
     /**
-     * @param val элемент
      * @param token должен порождать хендлер или быть хендлером с сигнатурой:
      * @code void handler(
      *       const boost::system::error_code& error // результат операции
@@ -229,6 +228,12 @@ public:
 #endif
     }
 
+    /// Пытается синхронно вставить элемент, если это возможно.
+    /// Возвращает true при успехе.
+    /// Возвращает false, когда возможна только асинхронная вставка с ожиданием.
+    /**
+     * @param val элемент
+     */
     template <typename U>
     bool tryPush(U&& val)
     {
@@ -242,6 +247,9 @@ public:
         return true;
     }
 
+    /// Пытается синхронно извлечь элемент.
+    /// Возвращает Optional<value_type> со значением при успехе.
+    /// Возвращает NullOptT, когда возможна только асинхронное извлечение с ожиданием.
     Optional<value_type> tryPop()
     {
         LockGuard lkGuard{ *this };
@@ -378,38 +386,14 @@ private:
 
     bool readyPush()
     {
+        // Лимит не превышен, или есть ожидающие извлечения из очереди с нулевым лимитом.
         return m_queue.size() < m_limit || 0 == m_limit && hasPendingPop();
-
-        //m_queue.emplace(std::forward<U>(val));
-
-        // Если есть ожидающие извлечения, выполняем извлечение.
-        //if (hasPendingPop_)
-        //{
-            // Если ждали извлечения, значит до этого уперлись в size == 0, и теперь он стал равен 1.
-            // При m_limit == 0, в очереди кратковременно появится 1 элемент, но снаружи это не заметно.
-        //    assert(m_queue.size() == 1);
-        //    doPendingPop();
-        //}
     }
 
     bool readyPop()
     {
-        //LockGuard lkGuard{ *this };
-
-        // Если очередь не пуста, то извлекаем, иначе откладываем.
-        //if (hasPendingPush())
-        //{
-        //    doPendingPush();
-            // Если ждали вставки, значит до этого уперлись в лимит,
-            // и теперь он будет кратковременно превышен на 1 элемент, но снаружи это не заметно.
-            //assert(m_queue.size() == m_limit + 1);
-        //}
-
+        // Очередь непуста, или есть ожидающие вставки в очередь с нулевым лимитом.
         return !m_queue.empty() || 0 == m_limit && hasPendingPush();
-
-        //Optional<value_type> val = std::move(m_queue.front());
-        //m_queue.pop();
-        //return true;// val;
     }
 
     // Инициатор вставки.
@@ -418,7 +402,7 @@ private:
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-              async::detail::CheckCallable<
+              detail::CheckCallable<
                   decltype(handler)
                 , void(const boost::system::error_code&)
                 >::value
@@ -428,14 +412,15 @@ private:
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
-        // Если лимит не превышен или есть ожидающие извлечения, то вставляем, иначе откладываем.
         if (readyPush())
         {
             doAsyncPush(std::forward<U>(val), std::forward<PushHandler>(handler));
             doPendingPop();
         }
         else
+        {
             deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
+        }
     }
 
     // Инициатор извлечения.
@@ -446,21 +431,15 @@ private:
         static_assert(
             detail::CheckCallable<
                   decltype(handler)
-                , void(const boost::system::error_code&, value_type)
-                >::value &&
-            detail::CheckCallable<
-                  decltype(handler)
-                , void(const boost::system::error_code&, NullOptT)
+                , void(const boost::system::error_code&, Optional<value_type>)
                 >::value
-            , "Handler must support two calls: 'handler(boost::system::error_code{}, Elem{})' and "
-              "'handler(boost::system::error_code{}, nullOpt)' "
-              "(you can simply use one overload with Optional<Elem> as second argument)."
+            , "Handler must support call: 'handler(boost::system::error_code{}, Optional<Elem>{})'."
             );
 
         // Именно тут блокируемся, а не в asyncPop.
         LockGuard lkGuard{ *this };
 
-        // Если очередь не пуста, то извлекаем, иначе откладываем.
+        // Сначала пытаемся выполнить отложенную вставку, если есть.
         if (doPendingPush() || readyPop())
             doAsyncPop(std::forward<PopHandler>(handler));
         else
@@ -598,7 +577,7 @@ private:
         assert(!hasPendingPush() && hasPendingPop());
     }
 
-    // Выполняет отложенную вставку.
+    // Если есть отложенная вставка,то выполняет ее и возвращает true, иначе возвращает false.
     bool doPendingPush(const boost::system::error_code& ec = {})
     {
         if (!hasPendingPush())
@@ -611,7 +590,7 @@ private:
         return true;
     }
 
-    // Выполняет отложенное извлечение.
+    // Если есть отложенное извлечение,то выполняет его и возвращает true, иначе возвращает false.
     bool doPendingPop(const boost::system::error_code& ec = {})
     {
         if (!hasPendingPop())

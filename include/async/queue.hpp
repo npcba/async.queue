@@ -37,9 +37,13 @@ namespace async {
 #if defined(BA_ASYNC_USE_BOOST_OPTIONAL) || !defined(__cpp_lib_optional)
     template <typename T>
     using Optional = boost::optional<T>;
+    using NullOptT = boost::none_t;
+    inline constexpr const boost::none_t& nullOpt = boost::none;
 #else
     template <typename T>
     using Optional = std::optional<T>;
+    using NullOptT = std::nullopt_t;
+    inline constexpr const std::nullopt_t& nullOpt = std::nullopt;
 #endif
 
 
@@ -190,7 +194,6 @@ public:
     /// Асинхронно извлекает элемент и по завершению исполняет хендлер,
     /// порожденный от token
     /**
-     * @param val элемент
      * @param token должен порождать хендлер или быть хендлером с сигнатурой:
      * @code void handler(
      *       const boost::system::error_code& error // результат операции
@@ -223,6 +226,42 @@ public:
         initPop(init.completion_handler);
         return init.result.get();
 #endif
+    }
+
+    /// Пытается синхронно вставить элемент, если это возможно.
+    /// Возвращает true при успехе.
+    /// Возвращает false, когда возможна только асинхронная вставка с ожиданием.
+    /**
+     * @param val элемент
+     */
+    template <typename U>
+    bool tryPush(U&& val)
+    {
+        LockGuard lkGuard{ *this };
+        if (!readyPush())
+            return false;
+
+        doPush(std::forward<U>(val));
+        doPendingPop();
+
+        return true;
+    }
+
+    /// Пытается синхронно извлечь элемент.
+    /// Возвращает Optional<value_type> со значением при успехе.
+    /// Возвращает NullOptT, когда возможна только асинхронное извлечение с ожиданием.
+    Optional<value_type> tryPop()
+    {
+        LockGuard lkGuard{ *this };
+        Optional<value_type> result;
+
+        if (!doPendingPush() && !readyPop())
+            return result;
+
+        result.emplace(std::move(m_queue.front()));
+        doPop();
+
+        return result;
     }
 
     /// Возвращает executor, ассоциированный с объектом.
@@ -261,13 +300,7 @@ public:
     std::size_t cancelOnePush()
     {
         LockGuard lkGuard{ *this };
-
-        if (!hasPendingPush())
-            return 0;
-
-        doPendingPush(boost::asio::error::operation_aborted);
-
-        return 1;
+        return doPendingPush(boost::asio::error::operation_aborted);
     }
 
     /// Отменяет все ожидающие операции вставки и возвращяет их количество.
@@ -275,25 +308,17 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        std::size_t n = 0;
-        while (cancelOnePush())
-            ++n;
+        if (!m_pendingOpsIsPushers)
+            return 0;
 
-        assert(!hasPendingPush());
-        return n;
+        return cancel();
     }
 
     /// Отменяет одну ожидающую операцию извлечения и возвращяет их количество (0 или 1).
     std::size_t cancelOnePop()
     {
         LockGuard lkGuard{ *this };
-
-        if (!hasPendingPop())
-            return 0;
-
-        doPendingPop(boost::asio::error::operation_aborted);
-
-        return 1;
+        return doPendingPop(boost::asio::error::operation_aborted);
     }
 
     /// Отменяет все ожидающие операции извлечения и возвращяет их количество.
@@ -301,12 +326,10 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        std::size_t n = 0;
-        while (cancelOnePop())
-            ++n;
+        if (m_pendingOpsIsPushers)
+            return 0;
 
-        assert(!hasPendingPop());
-        return n;
+        return cancel();
     }
 
     /// Отменяет все ожидающие операции вставки и извлечения и возвращяет их количество.
@@ -314,10 +337,12 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        // Сначала отменяются ждущие push.
-        std::size_t n = cancelPush();
-        // Потом pop, пусть будет определен такой порядок для пользователя.
-        return n + cancelPop();
+        std::size_t n = 0;
+        for (; !m_pendingOps.empty(); ++n)
+            m_pendingOps.pop(*this, boost::asio::error::operation_aborted);
+
+        assert(!hasPendingPush() && !hasPendingPop());
+        return n;
     }
 
     /// Очищает очередь. Отменяет все ожидающие операции и возвращяет их количество.
@@ -359,35 +384,42 @@ private:
         return !m_pendingOpsIsPushers && !m_pendingOps.empty();
     }
 
+    bool readyPush()
+    {
+        // Лимит не превышен, или есть ожидающие извлечения из очереди с нулевым лимитом.
+        return m_queue.size() < m_limit || 0 == m_limit && hasPendingPop();
+    }
+
+    bool readyPop()
+    {
+        // Очередь непуста, или есть ожидающие вставки в очередь с нулевым лимитом.
+        return !m_queue.empty() || 0 == m_limit && hasPendingPush();
+    }
+
     // Инициатор вставки.
     template <typename U, typename PushHandler>
     void initPush(U&& val, PushHandler&& handler)
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-              ba::async::detail::CheckCallable<
+              detail::CheckCallable<
                   decltype(handler)
                 , void(const boost::system::error_code&)
                 >::value
-            , "Handler signature must be 'void(const boost::system::error_code&)'"
+            , "Handler must support call: 'handler(boost::system::error_code{})'."
             );
 
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
-        // Если лимит не превышен или есть ожидающие извлечения, то вставляем, иначе откладываем.
-        if (m_queue.size() < m_limit || hasPendingPop())
-            doPush(std::forward<U>(val), std::forward<PushHandler>(handler));
-        else
-            deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
-
-        // Если есть ожидающие извлечения, выполняем извлечение.
-        if (hasPendingPop())
+        if (readyPush())
         {
-            // Если ждали извлечения, значит до этого уперлись в size == 0, и теперь он стал равен 1.
-            // При m_limit == 0, в очереди кратковременно появится 1 элемент, но снаружи это не заметно.
-            assert(m_queue.size() == 1);
+            doAsyncPush(std::forward<U>(val), std::forward<PushHandler>(handler));
             doPendingPop();
+        }
+        else
+        {
+            deferPush(std::forward<PushHandler>(handler), std::forward<U>(val));
         }
     }
 
@@ -397,28 +429,19 @@ private:
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
-            ba::async::detail::CheckCallable<
+            detail::CheckCallable<
                   decltype(handler)
                 , void(const boost::system::error_code&, Optional<value_type>)
                 >::value
-            , "Handler signature must be 'void(const boost::system::error_code&, Optional<Elem>)'"
+            , "Handler must support call: 'handler(boost::system::error_code{}, Optional<Elem>{})'."
             );
 
         // Именно тут блокируемся, а не в asyncPop.
         LockGuard lkGuard{ *this };
 
-        // Если есть ождающие вставки, то вставляем.
-        if (hasPendingPush())
-        {
-            doPendingPush();
-            // Если ждали вставки, значит до этого уперлись в лимит,
-            // и теперь он будет кратковременно превышен на 1 элемент, но снаружи это не заметно.
-            assert(m_queue.size() == m_limit + 1);
-        }
-
-        // Если очередь не пуста, то извлекаем, иначе откладываем.
-        if (!m_queue.empty())
-            doPop(std::forward<PopHandler>(handler));
+        // Сначала пытаемся выполнить отложенную вставку, если есть.
+        if (doPendingPush() || readyPop())
+            doAsyncPop(std::forward<PopHandler>(handler));
         else
             deferPop(std::forward<PopHandler>(handler));
     }
@@ -436,12 +459,8 @@ private:
     }
 
     // Комплитер извлечения.
-    template <typename PopHandler>
-    void completePop(
-          Optional<value_type>&& val
-        , PopHandler&& handler
-        , const boost::system::error_code& ec
-        )
+    template <typename PopHandler, typename U>
+    void completePop(PopHandler&& handler, const boost::system::error_code& ec, U&& val)
     {
         // move_binder2 не умеет форвардить handler, только перемещает.
         // Копируем, если lvalue-ссылка, иначе форвардим на перемещение (rvalue).
@@ -457,7 +476,7 @@ private:
         boost::asio::detail::move_binder2<
               std::decay_t<PopHandler>
             , boost::system::error_code
-            , Optional<value_type>
+            , std::decay_t<U>
             > binder{
                   0
                 , std::move(handlerCopy)
@@ -470,22 +489,38 @@ private:
         boost::asio::post(m_ex, std::move(binder));
     }
 
-    // Выполняет вставку, если ec == 0, затем уведомляет о завершении (ec != 0 при отмене).
-    template <typename U, typename PushHandler>
-    void doPush(U&& val, PushHandler&& handler)
+    template <typename U>
+    void doPush(U&& val)
     {
         assert(m_queue.size() <= m_limit);
         m_queue.emplace(std::forward<U>(val));
+    }
+    
+    // Выполняет вставку, если ec == 0, затем уведомляет о завершении (ec != 0 при отмене).
+    template <typename U, typename PushHandler>
+    void doAsyncPush(U&& val, PushHandler&& handler)
+    {
+        doPush(std::forward<U>(val));
         completePush(std::forward<PushHandler>(handler), boost::system::error_code{});
     }
 
-    // Уведомляет о завершении извлечения (ec ==0) или отмене (ec != 0), затем извлекает (при ec == 0).
-    template <typename PopHandler>
-    void doPop(PopHandler&& handler)
+    void doPop()
     {
         assert(!m_queue.empty());
-        completePop(std::move(m_queue.front()), std::forward<PopHandler>(handler), boost::system::error_code{});
         m_queue.pop();
+    }
+    
+    // Уведомляет о завершении извлечения (ec ==0) или отмене (ec != 0), затем извлекает (при ec == 0).
+    template <typename PopHandler>
+    void doAsyncPop(PopHandler&& handler)
+    {
+        assert(!m_queue.empty());
+        completePop(
+              std::forward<PopHandler>(handler)
+            , boost::system::error_code{}
+            , std::move(m_queue.front())
+            );
+        doPop();
     }
 
     template <typename Handler, typename U>
@@ -500,13 +535,13 @@ private:
         auto work = boost::asio::make_work_guard(m_ex);
 
         m_pendingOps.push(detail::bindAssociated(
-            [val{ value_type(std::forward<U>(val)) }, work{ std::move(work) }]
+            [work{ std::move(work) }, val{ value_type(std::forward<U>(val)) }]
             (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 if (ec) // Если отмена, то только уведомляем об отмене ожидающей вставки.
                     self.completePush(std::move(h), ec);
-                else // Иначе вставляем как обычно.
-                    self.doPush(std::move(val), std::move(h));
+                else
+                    self.doAsyncPush(std::move(val), std::move(h));
             }
             , std::move(handler))
         );
@@ -530,10 +565,10 @@ private:
             [work{ std::move(work) }]
             (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
-                if (ec) // Если отмена, то только уведомляем об отмене ожидающего извлечения.
-                    self.completePop(Optional<value_type>{}, std::move(h), ec);
-                else // Иначе извлекаем как обычно.
-                    self.doPop(std::move(h));
+                if (ec)
+                    self.completePop(std::move(h), ec, NullOptT(nullOpt));
+                else
+                    self.doAsyncPop(std::move(h));
             }
             , std::move(handler))
         );
@@ -542,20 +577,30 @@ private:
         assert(!hasPendingPush() && hasPendingPop());
     }
 
-    // Выполняет отложенную вставку.
-    void doPendingPush(const boost::system::error_code& ec = {})
+    // Если есть отложенная вставка,то выполняет ее и возвращает true, иначе возвращает false.
+    bool doPendingPush(const boost::system::error_code& ec = {})
     {
+        if (!hasPendingPush())
+            return false;
+
         assert(hasPendingPush() && !hasPendingPop());
         m_pendingOps.pop(*this, ec);
         assert(!hasPendingPop());
+
+        return true;
     }
 
-    // Выполняет отложенное извлечение.
-    void doPendingPop(const boost::system::error_code& ec = {})
+    // Если есть отложенное извлечение,то выполняет его и возвращает true, иначе возвращает false.
+    bool doPendingPop(const boost::system::error_code& ec = {})
     {
+        if (!hasPendingPop())
+            return false;
+
         assert(hasPendingPop() && !hasPendingPush());
         m_pendingOps.pop(*this, ec);
         assert(!hasPendingPush());
+
+        return true;
     }
 
     void checkInvariant() const

@@ -38,7 +38,9 @@ namespace async {
     template <typename T>
     using Optional = boost::optional<T>;
     using NullOptT = boost::none_t;
-    inline constexpr const boost::none_t& nullOpt = boost::none;
+    namespace {
+        const boost::none_t& nullOpt = boost::none;
+    }
 #else
     template <typename T>
     using Optional = std::optional<T>;
@@ -136,7 +138,7 @@ public:
         m_queue = std::move(other.m_queue);
         m_pendingOps = std::move(other.m_pendingOps);
         m_pendingOpsIsPushers = other.m_pendingOpsIsPushers;
-        m_isOpen.store(other.m_isOpen);
+        m_isOpen = other.m_isOpen;
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -302,7 +304,7 @@ public:
     std::size_t cancelOnePush()
     {
         LockGuard lkGuard{ *this };
-        return doPendingPush(QueueError::QUEUE_CANCELLED);
+        return doPendingPush(QueueError::OPERATION_CANCELLED);
     }
 
     /// Отменяет все ожидающие операции вставки и возвращяет их количество.
@@ -320,7 +322,7 @@ public:
     std::size_t cancelOnePop()
     {
         LockGuard lkGuard{ *this };
-        return doPendingPop(QueueError::QUEUE_CANCELLED);
+        return doPendingPop(QueueError::OPERATION_CANCELLED);
     }
 
     /// Отменяет все ожидающие операции извлечения и возвращяет их количество.
@@ -366,6 +368,7 @@ public:
     /// После вызова close возвращает false.
     bool isOpen()
     {
+        LockGuard lkGuard{ *this };
         return m_isOpen;
     }
 
@@ -384,7 +387,7 @@ private:
         , m_queue{ std::move(other.m_queue) }
         , m_pendingOps{ std::move(other.m_pendingOps) }
         , m_pendingOpsIsPushers{ other.m_pendingOpsIsPushers }
-        , m_isOpen{ other.m_isOpen.load() }
+        , m_isOpen{ other.m_isOpen }
     {
     }
 
@@ -664,7 +667,7 @@ private:
 
     // Флажок, который указывает, что именно хранится в очереди: отложенные вставки или извлечения.
     bool m_pendingOpsIsPushers = false;
-    std::atomic_bool m_isOpen = true;
+    bool m_isOpen = true;
 };
 
 

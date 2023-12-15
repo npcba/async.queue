@@ -3,6 +3,7 @@
 #include "queue/detail/function_queue.hpp"
 #include "queue/detail/check_callable.hpp"
 #include "queue/detail/associated_binder.hpp"
+#include "queue/error.hpp"
 
 #include <type_traits>
 #include <queue>
@@ -12,7 +13,6 @@
 #include <boost/asio/executor.hpp>
 #include <boost/asio/execution_context.hpp>
 #include <boost/asio/async_result.hpp>
-#include <boost/asio/error.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/post.hpp>
 
@@ -38,7 +38,9 @@ namespace async {
     template <typename T>
     using Optional = boost::optional<T>;
     using NullOptT = boost::none_t;
-    inline constexpr const boost::none_t& nullOpt = boost::none;
+    namespace {
+        const boost::none_t& nullOpt = boost::none;
+    }
 #else
     template <typename T>
     using Optional = std::optional<T>;
@@ -136,6 +138,7 @@ public:
         m_queue = std::move(other.m_queue);
         m_pendingOps = std::move(other.m_pendingOps);
         m_pendingOpsIsPushers = other.m_pendingOpsIsPushers;
+        m_isOpen = other.m_isOpen;
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -162,7 +165,8 @@ public:
      * :)
      * Если очередь заполнена, вставка элемента и вызов handler произойдет
      * после очередного вызова @ref asyncPop.
-     * При отмене ожидаемой операции error == boost::asio::error::operation_aborted.
+     * При отмене ожидаемой операции error == QueueError::OPERATION_CANCELLED.
+     * При закрытии очереди error == QueueError::QUEUE_CLOSED.
      */
     template <typename U, typename PushToken>
     auto asyncPush(U&& val, PushToken&& token)
@@ -202,8 +206,8 @@ public:
      * :)
      * Если очередь пуста, извлечение элемента и вызов handler произойдет
      * после очередного вызова @ref asyncPush.
-     * При отмене ожидаемой операции error == boost::asio::error::operation_aborted и
-     * value == Optional<Elem>{}
+     * При отмене ожидаемой операции error == QueueError::OPERATION_CANCELLED и value == nullOpt.
+     * При закрытой и пустой очереди error == QueueError::QUEUE_CLOSED и value == nullOpt.
      */
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
@@ -238,7 +242,7 @@ public:
     bool tryPush(U&& val)
     {
         LockGuard lkGuard{ *this };
-        if (!readyPush())
+        if (!readyPush() || !m_isOpen)
             return false;
 
         doPush(std::forward<U>(val));
@@ -249,7 +253,7 @@ public:
 
     /// Пытается синхронно извлечь элемент.
     /// Возвращает Optional<value_type> со значением при успехе.
-    /// Возвращает NullOptT, когда возможна только асинхронное извлечение с ожиданием.
+    /// Возвращает nullOpt, когда возможно только асинхронное извлечение с ожиданием.
     Optional<value_type> tryPop()
     {
         LockGuard lkGuard{ *this };
@@ -300,7 +304,7 @@ public:
     std::size_t cancelOnePush()
     {
         LockGuard lkGuard{ *this };
-        return doPendingPush(boost::asio::error::operation_aborted);
+        return doPendingPush(QueueError::OPERATION_CANCELLED);
     }
 
     /// Отменяет все ожидающие операции вставки и возвращяет их количество.
@@ -318,7 +322,7 @@ public:
     std::size_t cancelOnePop()
     {
         LockGuard lkGuard{ *this };
-        return doPendingPop(boost::asio::error::operation_aborted);
+        return doPendingPop(QueueError::OPERATION_CANCELLED);
     }
 
     /// Отменяет все ожидающие операции извлечения и возвращяет их количество.
@@ -336,24 +340,36 @@ public:
     std::size_t cancel()
     {
         LockGuard lkGuard{ *this };
-
-        std::size_t n = 0;
-        for (; !m_pendingOps.empty(); ++n)
-            m_pendingOps.pop(*this, boost::asio::error::operation_aborted);
-
-        assert(!hasPendingPush() && !hasPendingPop());
-        return n;
+        return doCancel(QueueError::OPERATION_CANCELLED);
     }
 
-    /// Очищает очередь. Отменяет все ожидающие операции и возвращяет их количество.
-    std::size_t reset()
+    /// Очищает очередь. Отменяет все ожидающие операции.
+    void reset()
     {
         LockGuard lkGuard{ *this };
 
         // У std::queue не clear :)
         m_queue = container_type{};
+        doCancel(QueueError::OPERATION_CANCELLED);
+        m_isOpen = true;
+    }
 
-        return cancel();
+    /// Закрывает очередь для последующей вставки, отменяет все отложенные операции.
+    /// Извлечение будет успешно вплоть до опустошения очереди, дальнейшее извлечение приведет к ошибке.
+    void close()
+    {
+        LockGuard lkGuard{ *this };
+        m_isOpen = false;
+        doCancel(QueueError::QUEUE_CLOSED);
+    }
+
+    /// Показывает открыта ли очередь.
+    /// После создания очереди или после вызова reset возвращает true.
+    /// После вызова close возвращает false.
+    bool isOpen()
+    {
+        LockGuard lkGuard{ *this };
+        return m_isOpen;
     }
 
 private:
@@ -371,6 +387,7 @@ private:
         , m_queue{ std::move(other.m_queue) }
         , m_pendingOps{ std::move(other.m_pendingOps) }
         , m_pendingOpsIsPushers{ other.m_pendingOpsIsPushers }
+        , m_isOpen{ other.m_isOpen }
     {
     }
 
@@ -412,6 +429,13 @@ private:
         // Именно тут блокируемся, а не в asyncPush.
         LockGuard lkGuard{ *this };
 
+        // Если очередь закрыта, завершаем с ошибкой, в закрытую очередь не вставляем.
+        if (!m_isOpen)
+        {
+            completePush(std::forward<PushHandler>(handler), QueueError::QUEUE_CLOSED);
+            return;
+        }
+
         if (readyPush())
         {
             doAsyncPush(std::forward<U>(val), std::forward<PushHandler>(handler));
@@ -441,9 +465,16 @@ private:
 
         // Сначала пытаемся выполнить отложенную вставку, если есть.
         if (doPendingPush() || readyPop())
+        {
             doAsyncPop(std::forward<PopHandler>(handler));
-        else
+            return;
+        }
+
+        // Извлекать нечего, откладываем при открытой очереди или завершаем с ошибкой при закрытой.
+        if (m_isOpen)
             deferPop(std::forward<PopHandler>(handler));
+        else
+            completePop(std::forward<PopHandler>(handler), QueueError::QUEUE_CLOSED, NullOptT(nullOpt));
     }
 
     // Комплитер вставки.
@@ -523,8 +554,8 @@ private:
         doPop();
     }
 
-    template <typename Handler, typename U>
-    void deferPush(Handler&& handler, U&& val)
+    template <typename PushHandler, typename U>
+    void deferPush(PushHandler&& handler, U&& val)
     {
         assert(!hasPendingPop());
 
@@ -536,22 +567,22 @@ private:
 
         m_pendingOps.push(detail::bindAssociated(
             [work{ std::move(work) }, val{ value_type(std::forward<U>(val)) }]
-            (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
+            (PushHandler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 if (ec) // Если отмена, то только уведомляем об отмене ожидающей вставки.
                     self.completePush(std::move(h), ec);
                 else
                     self.doAsyncPush(std::move(val), std::move(h));
             }
-            , std::move(handler))
+            , std::forward<PushHandler>(handler))
         );
         m_pendingOpsIsPushers = true;
 
         assert(!hasPendingPop() && hasPendingPush());
     }
 
-    template <typename Handler>
-    void deferPop(Handler&& handler)
+    template <typename PopHandler>
+    void deferPop(PopHandler&& handler)
     {
         assert(!hasPendingPush());
 
@@ -563,14 +594,14 @@ private:
 
         m_pendingOps.push(detail::bindAssociated(
             [work{ std::move(work) }]
-            (Handler& h, Queue& self, const boost::system::error_code& ec) mutable
+            (PopHandler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 if (ec)
                     self.completePop(std::move(h), ec, NullOptT(nullOpt));
                 else
                     self.doAsyncPop(std::move(h));
             }
-            , std::move(handler))
+            , std::forward<PopHandler>(handler))
         );
         m_pendingOpsIsPushers = false;
 
@@ -603,11 +634,22 @@ private:
         return true;
     }
 
+    std::size_t doCancel(const boost::system::error_code& ec)
+    {
+        std::size_t n = 0;
+        for (; !m_pendingOps.empty(); ++n)
+            m_pendingOps.pop(*this, ec);
+
+        assert(!hasPendingPush() && !hasPendingPop());
+        return n;
+    }
+
     void checkInvariant() const
     {
         assert(m_queue.size() <= m_limit);
         assert(m_queue.size() == m_limit || !hasPendingPush());
         assert(m_queue.empty() || !hasPendingPop());
+        assert(m_isOpen || m_pendingOps.empty());
     }
 
 private:
@@ -625,6 +667,7 @@ private:
 
     // Флажок, который указывает, что именно хранится в очереди: отложенные вставки или извлечения.
     bool m_pendingOpsIsPushers = false;
+    bool m_isOpen = true;
 };
 
 

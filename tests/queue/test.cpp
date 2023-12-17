@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <tuple>
 
 #include <boost/test/included/unit_test.hpp>
 #include <boost/asio/use_future.hpp>
@@ -42,22 +43,22 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q0{ ioc, 10 };
 
-    q0.asyncPush(123, boost::asio::bind_executor(s1, [s1](boost::system::error_code ec) {
+    q0.asyncPush(123, boost::asio::bind_executor(s1, [s1](boost::system::error_code) {
         BOOST_CHECK(s1.running_in_this_thread());
         }));
 
-    q0.asyncPop(boost::asio::bind_executor(s1, [s1](boost::system::error_code ec, ba::async::Optional<int> val) {
+    q0.asyncPop(boost::asio::bind_executor(s1, [s1](boost::system::error_code, ba::async::Optional<int> val) {
         BOOST_CHECK(s1.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         }));
 
     ThreadPool{ ioc, 10 }.join();
 
-    q0.asyncPush(123, s2.wrap([s2](boost::system::error_code ec) {
+    q0.asyncPush(123, s2.wrap([s2](boost::system::error_code) {
         BOOST_CHECK(s2.running_in_this_thread());
         }));
 
-    q0.asyncPop(s2.wrap([s2](boost::system::error_code ec, ba::async::Optional<int> val) {
+    q0.asyncPop(s2.wrap([s2](boost::system::error_code, ba::async::Optional<int> val) {
         BOOST_CHECK(s2.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         }));
@@ -67,12 +68,12 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q1{ s1, 10 };
 
-    q1.asyncPop([s1](boost::system::error_code ec, ba::async::Optional<int> val) {
+    q1.asyncPop([s1](boost::system::error_code, ba::async::Optional<int> val) {
         BOOST_CHECK(s1.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         });
 
-    q1.asyncPush(123, [s1](boost::system::error_code ec) {
+    q1.asyncPush(123, [s1](boost::system::error_code) {
         BOOST_CHECK(s1.running_in_this_thread());
         });
 
@@ -81,12 +82,12 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q2{ s2, 10 };
 
-    q2.asyncPop([s2](boost::system::error_code ec, ba::async::Optional<int> val) {
+    q2.asyncPop([s2](boost::system::error_code, ba::async::Optional<int> val) {
         BOOST_CHECK(s2.running_in_this_thread());
         BOOST_CHECK(123 == *val);
         });
 
-    q2.asyncPush(123, [s2](boost::system::error_code ec) {
+    q2.asyncPush(123, [s2](boost::system::error_code) {
         BOOST_CHECK(s2.running_in_this_thread());
         });
 
@@ -247,7 +248,7 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
     ba::async::Queue<Movable> q{ ioc, 10 };
 
     q.asyncPush(Movable{}, [](boost::system::error_code) {});
-    q.asyncPop([](boost::system::error_code, ba::async::Optional<Movable> val) {});
+    q.asyncPop([](boost::system::error_code, ba::async::Optional<Movable>) {});
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         q.asyncPush(Movable{}, yield);
@@ -255,6 +256,7 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         Movable m = std::move(q.asyncPop(yield).value());
+        std::ignore = m;
     });
 
     std::future<void> fPush = q.asyncPush(Movable{}, boost::asio::use_future);
@@ -350,16 +352,16 @@ public:
     explicit handler_allocator() = default;
 
     template <typename U>
-    handler_allocator(const handler_allocator<U>& other) noexcept
+    handler_allocator(const handler_allocator<U>&) noexcept
     {
     }
 
-    bool operator==(const handler_allocator& other) const noexcept
+    bool operator==(const handler_allocator&) const noexcept
     {
         return true;
     }
 
-    bool operator!=(const handler_allocator& other) const noexcept
+    bool operator!=(const handler_allocator&) const noexcept
     {
         return false;
     }
@@ -384,12 +386,10 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
         Handler() = default;
         Handler(const Handler&)
         {
-            auto a = 1;
         }
 
         Handler(Handler&&)
         {
-            auto a = 1;
         }
 
         using allocator_type = handler_allocator<Handler>;
@@ -399,16 +399,12 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
             return allocator_type{};
         }
 
-        void operator()(boost::system::error_code ec)
+        void operator()(boost::system::error_code)
         {
-            //std::cout << std::this_thread::get_id() << ": void operator()(boost::system::error_code ec)" << std::endl << std::endl << std::flush;
-            auto e = ec;
         }
 
-        void operator()(boost::system::error_code ec, ba::async::Optional<int>)
+        void operator()(boost::system::error_code, ba::async::Optional<int>)
         {
-            //std::cout << std::this_thread::get_id() << ": void operator()(boost::system::error_code ec, ba::async::Optional<int>)" << std::endl << std::endl << std::flush;
-            auto e = ec;
         }
     };
 

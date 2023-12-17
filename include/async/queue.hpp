@@ -404,13 +404,13 @@ private:
     bool readyPush()
     {
         // Лимит не превышен, или есть ожидающие извлечения из очереди с нулевым лимитом.
-        return m_queue.size() < m_limit || 0 == m_limit && hasPendingPop();
+        return m_queue.size() < m_limit || (0 == m_limit && hasPendingPop());
     }
 
     bool readyPop()
     {
         // Очередь непуста, или есть ожидающие вставки в очередь с нулевым лимитом.
-        return !m_queue.empty() || 0 == m_limit && hasPendingPush();
+        return !m_queue.empty() || (0 == m_limit && hasPendingPush());
     }
 
     // Инициатор вставки.

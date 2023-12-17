@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <tuple>
 
 #include <boost/test/included/unit_test.hpp>
 #include <boost/asio/use_future.hpp>
@@ -255,7 +256,7 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         Movable m = std::move(q.asyncPop(yield).value());
-        (m);
+        std::ignore = m;
     });
 
     std::future<void> fPush = q.asyncPush(Movable{}, boost::asio::use_future);

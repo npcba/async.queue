@@ -5,7 +5,9 @@ enable_testing()
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-deprecated-declarations -Wno-comments -Wsuggest-override -Werror")
+if(GCC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-deprecated-declarations -Wno-comments -Wsuggest-override -Werror")
+endif(GCC)
 
 if (NOT DEFINED Boost_FOUND)
     set(Boost_USE_STATIC_LIBS ON)

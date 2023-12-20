@@ -16,12 +16,6 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/post.hpp>
 
-#if defined(BA_ASYNC_USE_BOOST_OPTIONAL) || !defined(__cpp_lib_optional)
-#   include <boost/optional/optional.hpp>
-#else
-#   include <optional>
-#endif
-
 // Библиотека использует недокументированный boost::asio::detail::binder и move_binder
 // Они широко используется во внутренностях asio, и, вероятно, его поддержка не иссякнет.
 // Предпочтительнее использовать его, т.к. его поддерживают и могут добавить для него новые traits.
@@ -33,21 +27,6 @@
 
 namespace ba {
 namespace async {
-
-#if defined(BA_ASYNC_USE_BOOST_OPTIONAL) || !defined(__cpp_lib_optional)
-    template <typename T>
-    using Optional = boost::optional<T>;
-    using NullOptT = boost::none_t;
-    namespace {
-        const boost::none_t& nullOpt = boost::none;
-    }
-#else
-    template <typename T>
-    using Optional = std::optional<T>;
-    using NullOptT = std::nullopt_t;
-    inline constexpr const std::nullopt_t& nullOpt = std::nullopt;
-#endif
-
 
 /// Асинхронная очередь с ограничением длины (минимум 0).
 /**
@@ -178,7 +157,7 @@ public:
 
         // Можно было бы определить аргумент val как value_type, но лишившись perfect forwarding.
         // Поэтому U&& и с проверкой is_convertible.
-        static_assert(std::is_convertible<U, value_type>::value, "'val' must converts to 'value_type'");
+        static_assert(std::is_convertible<U, value_type>::value, "'val' must converts to 'Elem' type");
 
 #if BOOST_VERSION >= 107000
         return boost::asio::async_initiate<PushToken, void(boost::system::error_code)>(
@@ -201,13 +180,13 @@ public:
      * @param token должен порождать хендлер или быть хендлером с сигнатурой:
      * @code void handler(
      *       const boost::system::error_code& error // результат операции
-     *     , Optional<Elem> value // извлеченное значение
+     *     , Elem value // извлеченное значение
      * ); @endcode
      * :)
      * Если очередь пуста, извлечение элемента и вызов handler произойдет
      * после очередного вызова @ref asyncPush.
-     * При отмене ожидаемой операции error == QueueError::OPERATION_CANCELLED и value == nullOpt.
-     * При закрытой и пустой очереди error == QueueError::QUEUE_CLOSED и value == nullOpt.
+     * При отмене ожидаемой операции error == QueueError::OPERATION_CANCELLED и value == Elem{}.
+     * При закрытой и пустой очереди error == QueueError::QUEUE_CLOSED и value == Elem{}.
      */
     template <typename PopToken>
     auto asyncPop(PopToken&& token)
@@ -218,13 +197,13 @@ public:
         // Вместо этого мьютекс лочится в initPop.
 
 #if BOOST_VERSION >= 107000
-        return boost::asio::async_initiate<PopToken, void(boost::system::error_code, Optional<value_type>)>(
+        return boost::asio::async_initiate<PopToken, void(boost::system::error_code, value_type)>(
             AsyncInit{ *this }, token
             );
 #else
         boost::asio::async_completion<
               PopToken
-            , void(boost::system::error_code, Optional<value_type>)
+            , void(boost::system::error_code, value_type)
             > init{ token };
 
         initPop(init.completion_handler);
@@ -252,20 +231,35 @@ public:
     }
 
     /// Пытается синхронно извлечь элемент.
-    /// Возвращает Optional<value_type> со значением при успехе.
-    /// Возвращает nullOpt, когда возможно только асинхронное извлечение с ожиданием.
-    Optional<value_type> tryPop()
+    /// Возвращает элемент при успехе.
+    /// Возвращает Elem{}, когда возможно только асинхронное извлечение с ожиданием.
+    /**
+     * @param success - ссылка, по которой записывается флаг успешности операции.
+     */
+    value_type tryPop(bool& success)
     {
         LockGuard lkGuard{ *this };
-        Optional<value_type> result;
 
         if (!doPendingPush() && !readyPop())
-            return result;
+        {
+            success = false;
+            return value_type{};
+        }
 
-        result.emplace(std::move(m_queue.front()));
+        value_type result = std::move(m_queue.front());
         doPop();
 
+        success = true;
         return result;
+    }
+
+    /// Пытается синхронно извлечь элемент.
+    /// Возвращает элемент при успехе.
+    /// Возвращает Elem{}, когда возможно только асинхронное извлечение с ожиданием.
+    value_type tryPop()
+    {
+        bool ignoreSuccess = false;
+        return tryPop(ignoreSuccess);
     }
 
     /// Возвращает executor, ассоциированный с объектом.
@@ -455,9 +449,9 @@ private:
         static_assert(
             detail::CheckCallable<
                   decltype(handler)
-                , void(const boost::system::error_code&, Optional<value_type>)
+                , void(const boost::system::error_code&, value_type)
                 >::value
-            , "Handler must support call: 'handler(boost::system::error_code{}, Optional<Elem>{})'."
+            , "Handler must support call: 'handler(boost::system::error_code{}, Elem{})'."
             );
 
         // Именно тут блокируемся, а не в asyncPop.
@@ -474,7 +468,7 @@ private:
         if (m_isOpen)
             deferPop(std::forward<PopHandler>(handler));
         else
-            completePop(std::forward<PopHandler>(handler), QueueError::QUEUE_CLOSED, NullOptT(nullOpt));
+            completePop(std::forward<PopHandler>(handler), QueueError::QUEUE_CLOSED, value_type{});
     }
 
     // Комплитер вставки.
@@ -490,8 +484,8 @@ private:
     }
 
     // Комплитер извлечения.
-    template <typename PopHandler, typename U>
-    void completePop(PopHandler&& handler, const boost::system::error_code& ec, U&& val)
+    template <typename PopHandler>
+    void completePop(PopHandler&& handler, const boost::system::error_code& ec, value_type&& val)
     {
         // move_binder2 не умеет форвардить handler, только перемещает.
         // Копируем, если lvalue-ссылка, иначе форвардим на перемещение (rvalue).
@@ -507,7 +501,7 @@ private:
         boost::asio::detail::move_binder2<
               std::decay_t<PopHandler>
             , boost::system::error_code
-            , std::decay_t<U>
+            , value_type
             > binder{
                   0
                 , std::move(handlerCopy)
@@ -597,7 +591,7 @@ private:
             (PopHandler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 if (ec)
-                    self.completePop(std::move(h), ec, NullOptT(nullOpt));
+                    self.completePop(std::move(h), ec, value_type{});
                 else
                     self.doAsyncPop(std::move(h));
             }

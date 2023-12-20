@@ -28,6 +28,16 @@
 namespace ba {
 namespace async {
 
+template <typename T>
+struct DefaultConstruct
+{
+    T operator()() const noexcept(noexcept(T{}))
+    {
+        return T{};
+    }
+};
+
+
 /// Асинхронная очередь с ограничением длины (минимум 0).
 /**
  * Потокобезопасная.
@@ -37,6 +47,7 @@ template <
       typename Elem
     , typename Executor = boost::asio::executor
     , typename HandlerDefaultAllocator = std::allocator<unsigned char>
+    , typename NullValueGenerator = DefaultConstruct<Elem>
     , typename Container = std::queue<Elem>
     >
 class Queue
@@ -60,11 +71,17 @@ public:
           const executor_type& ex
         , std::size_t limit
         , const HandlerDefaultAllocator& handlerDefAlloc = HandlerDefaultAllocator{}
+        , NullValueGenerator nullValueGen = NullValueGenerator{}
         )
         : m_ex{ ex }
         , m_limit{ limit }
         , m_pendingOps{ handlerDefAlloc }
+        , m_nullValueGen{ std::move(nullValueGen) }
     {
+        static_assert(
+            !std::is_lvalue_reference<decltype(nullValueGen())>::value
+            ,"'nullValueGen()' must return non lvalue-reference."
+            );
         checkInvariant();
     }
 
@@ -78,11 +95,12 @@ public:
           ExecutionContext& context
         , std::size_t limit
         , const HandlerDefaultAllocator& handlerDefAlloc = HandlerDefaultAllocator{}
+        , NullValueGenerator nullValueGen = NullValueGenerator{}
         , typename std::enable_if_t<
             std::is_convertible<ExecutionContext&, boost::asio::execution_context&>::value
             >* = 0
         )
-        : Queue{ context.get_executor(), limit, handlerDefAlloc }
+        : Queue{ context.get_executor(), limit, handlerDefAlloc, std::move(nullValueGen)}
     {
     }
 
@@ -118,6 +136,7 @@ public:
         m_pendingOps = std::move(other.m_pendingOps);
         m_pendingOpsIsPushers = other.m_pendingOpsIsPushers;
         m_isOpen = other.m_isOpen;
+        m_nullValueGen = std::move(other.m_nullValueGen);
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -243,7 +262,7 @@ public:
         if (!doPendingPush() && !readyPop())
         {
             success = false;
-            return value_type{};
+            return m_nullValueGen();
         }
 
         value_type result = std::move(m_queue.front());
@@ -382,6 +401,7 @@ private:
         , m_pendingOps{ std::move(other.m_pendingOps) }
         , m_pendingOpsIsPushers{ other.m_pendingOpsIsPushers }
         , m_isOpen{ other.m_isOpen }
+        , m_nullValueGen{ std::move(other.m_nullValueGen) }
     {
     }
 
@@ -468,7 +488,7 @@ private:
         if (m_isOpen)
             deferPop(std::forward<PopHandler>(handler));
         else
-            completePop(std::forward<PopHandler>(handler), QueueError::QUEUE_CLOSED, value_type{});
+            completePop(std::forward<PopHandler>(handler), QueueError::QUEUE_CLOSED, m_nullValueGen());
     }
 
     // Комплитер вставки.
@@ -484,8 +504,8 @@ private:
     }
 
     // Комплитер извлечения.
-    template <typename PopHandler>
-    void completePop(PopHandler&& handler, const boost::system::error_code& ec, value_type&& val)
+    template <typename PopHandler, typename U>
+    void completePop(PopHandler&& handler, const boost::system::error_code& ec, U&& val)
     {
         // move_binder2 не умеет форвардить handler, только перемещает.
         // Копируем, если lvalue-ссылка, иначе форвардим на перемещение (rvalue).
@@ -501,7 +521,7 @@ private:
         boost::asio::detail::move_binder2<
               std::decay_t<PopHandler>
             , boost::system::error_code
-            , value_type
+            , U
             > binder{
                   0
                 , std::move(handlerCopy)
@@ -591,7 +611,7 @@ private:
             (PopHandler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 if (ec)
-                    self.completePop(std::move(h), ec, value_type{});
+                    self.completePop(std::move(h), ec, self.m_nullValueGen());
                 else
                     self.doAsyncPop(std::move(h));
             }
@@ -662,6 +682,7 @@ private:
     // Флажок, который указывает, что именно хранится в очереди: отложенные вставки или извлечения.
     bool m_pendingOpsIsPushers = false;
     bool m_isOpen = true;
+    NullValueGenerator m_nullValueGen;
 };
 
 
@@ -671,12 +692,14 @@ template <
       typename Elem
     , typename Executor
     , typename HandlerDefaultAllocator
+    , typename NullValueGenerator
     , typename Container
     >
 class Queue<
       Elem
     , Executor
     , HandlerDefaultAllocator
+    , NullValueGenerator
     , Container
     >::LockGuard
 {
@@ -705,12 +728,14 @@ template <
       typename Elem
     , typename Executor
     , typename HandlerDefaultAllocator
+    , typename NullValueGenerator
     , typename Container
     >
 class Queue<
       Elem
     , Executor
     , HandlerDefaultAllocator
+    , NullValueGenerator
     , Container
     >::AsyncInit
 {

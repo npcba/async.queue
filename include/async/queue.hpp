@@ -208,7 +208,7 @@ public:
             , void(boost::system::error_code, value_type)
             > init{ token };
 
-        initPop(init.completion_handler);
+        initPop(init.completion_handler, std::forward<DefValueGen>(defvalueGen));
         return init.result.get();
 #endif
     }

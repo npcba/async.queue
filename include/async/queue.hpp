@@ -162,8 +162,15 @@ public:
         static_assert(std::is_convertible<U, value_type>::value, "'val' must converts to 'Elem' type");
 
 #if BOOST_VERSION >= 107000
+        auto initiate = [this](auto&& handler, auto&& val) {
+            initPush(
+                  std::forward<decltype(val)>(val)
+                , std::forward<decltype(handler)>(handler)
+                );
+        };
+
         return boost::asio::async_initiate<PushToken, void(boost::system::error_code)>(
-            AsyncInit{ *this }, token, std::forward<U>(val)
+            std::move(initiate), token, std::forward<U>(val)
             );
 #else
         boost::asio::async_completion<
@@ -199,8 +206,15 @@ public:
         // Вместо этого мьютекс лочится в initPop.
 
 #if BOOST_VERSION >= 107000
+        auto initiate = [this](auto&& handler, auto&& defvalueGen) {
+            initPop(
+                  std::forward<decltype(handler)>(handler)
+                , std::forward<decltype(defvalueGen)>(defvalueGen)
+                );
+        };
+
         return boost::asio::async_initiate<PopToken, void(boost::system::error_code, value_type)>(
-            AsyncInit{ *this }, token, std::forward<DefValueGen>(defvalueGen), 0
+            std::move(initiate), token, std::forward<DefValueGen>(defvalueGen)
             );
 #else
         boost::asio::async_completion<
@@ -374,10 +388,6 @@ private:
     // Обертка над std::unique_lock.
     // Не только лочит мьютекс, но и проверяет инвариант Queue в конструкторе и деструкторе.
     class LockGuard;
-
-#if BOOST_VERSION >= 107000
-    class AsyncInit;
-#endif
 
     Queue(Queue&& other, const LockGuard&)
         : m_ex{ other.m_ex } // В other.m_ex остается копия, чтобы объект остался в валидном состоянии.
@@ -708,59 +718,6 @@ private:
     const Queue& m_self;
     std::lock_guard<std::recursive_mutex> m_lk;
 };
-
-
-#if BOOST_VERSION >= 107000
-// Обертка-функтор для asio::async_initiate, чтобы не городить лямбду
-// и выставить из нее get_executor() непонятно зачем.
-template <
-      typename Elem
-    , typename Executor
-    , typename HandlerDefaultAllocator
-    , typename Container
-    >
-class Queue<
-      Elem
-    , Executor
-    , HandlerDefaultAllocator
-    , Container
-    >::AsyncInit
-{
-public:
-    // В документации asio::async_initiate ничего не сказано о возможной поддержке
-    // executor_type / get_executor() в типе инициатора, но тем не менее разработчики asio
-    // в своих компонентах выставляют эти имена из соответствующих инициаторов.
-    // Выставим и мы, не жалко, поскольку они и так есть у нас.
-    using executor_type = typename Queue::executor_type;
-    executor_type get_executor() const
-    {
-        return m_self.get_executor();
-    }
-
-    AsyncInit(Queue& self)
-        : m_self{ self }
-    {
-    }
-
-    // Чтобы не копипастить AsyncInit отдельно для push и pop, в одном классе перегрузим 2 operator(),
-    // для отличия сигнатур для pop добавлен фиктивный аргумент int.
-
-    template <typename PushHandler, typename U>
-    void operator()(PushHandler&& handler, U&& val) const
-    {
-        m_self.initPush(std::forward<U>(val), std::forward<PushHandler>(handler));
-    }
-
-    template <typename PopHandler, typename DefValueGen>
-    void operator()(PopHandler&& handler, DefValueGen&& defvalueGen, int) const
-    {
-        m_self.initPop(std::forward<PopHandler>(handler), std::forward<DefValueGen>(defvalueGen));
-    }
-
-private:
-    Queue& m_self;
-};
-#endif // BOOST_VERSION >= 107000
 
 } // namespace async
 } // namespace ba

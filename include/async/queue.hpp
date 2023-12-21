@@ -1,9 +1,11 @@
 #pragma once
 
+#include "queue/value_factory.hpp"
+#include "queue/error.hpp"
 #include "queue/detail/function_queue.hpp"
 #include "queue/detail/check_callable.hpp"
 #include "queue/detail/associated_binder.hpp"
-#include "queue/error.hpp"
+#include "queue/detail/compressed_pair.hpp"
 
 #include <type_traits>
 #include <queue>
@@ -28,16 +30,6 @@
 namespace ba {
 namespace async {
 
-template <typename T>
-struct DefaultConstruct
-{
-    T operator()() const noexcept(noexcept(T{}))
-    {
-        return T{};
-    }
-};
-
-
 /// Асинхронная очередь с ограничением длины (минимум 0).
 /**
  * Потокобезопасная.
@@ -47,7 +39,6 @@ template <
       typename Elem
     , typename Executor = boost::asio::executor
     , typename HandlerDefaultAllocator = std::allocator<unsigned char>
-    , typename NullValueGenerator = DefaultConstruct<Elem>
     , typename Container = std::queue<Elem>
     >
 class Queue
@@ -71,17 +62,11 @@ public:
           const executor_type& ex
         , std::size_t limit
         , const HandlerDefaultAllocator& handlerDefAlloc = HandlerDefaultAllocator{}
-        , NullValueGenerator nullValueGen = NullValueGenerator{}
         )
         : m_ex{ ex }
         , m_limit{ limit }
         , m_pendingOps{ handlerDefAlloc }
-        , m_nullValueGen{ std::move(nullValueGen) }
     {
-        static_assert(
-            !std::is_lvalue_reference<decltype(nullValueGen())>::value
-            ,"'nullValueGen()' must return non lvalue-reference."
-            );
         checkInvariant();
     }
 
@@ -95,12 +80,11 @@ public:
           ExecutionContext& context
         , std::size_t limit
         , const HandlerDefaultAllocator& handlerDefAlloc = HandlerDefaultAllocator{}
-        , NullValueGenerator nullValueGen = NullValueGenerator{}
         , typename std::enable_if_t<
             std::is_convertible<ExecutionContext&, boost::asio::execution_context&>::value
             >* = 0
         )
-        : Queue{ context.get_executor(), limit, handlerDefAlloc, std::move(nullValueGen)}
+        : Queue{ context.get_executor(), limit, handlerDefAlloc }
     {
     }
 
@@ -136,7 +120,6 @@ public:
         m_pendingOps = std::move(other.m_pendingOps);
         m_pendingOpsIsPushers = other.m_pendingOpsIsPushers;
         m_isOpen = other.m_isOpen;
-        m_nullValueGen = std::move(other.m_nullValueGen);
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -207,8 +190,8 @@ public:
      * При отмене ожидаемой операции error == QueueError::OPERATION_CANCELLED и value == Elem{}.
      * При закрытой и пустой очереди error == QueueError::QUEUE_CLOSED и value == Elem{}.
      */
-    template <typename PopToken>
-    auto asyncPop(PopToken&& token)
+    template <typename PopToken, typename DefValueGen = ValueFactory<value_type>>
+    auto asyncPop(PopToken&& token, DefValueGen&& defvalueGen = DefValueGen{})
     {
         // Важно: захват мьютекса в этом методе делать нельзя,
         // Вконце asio::async_initiate или init.result.get() происходит суспенд корутины
@@ -217,7 +200,7 @@ public:
 
 #if BOOST_VERSION >= 107000
         return boost::asio::async_initiate<PopToken, void(boost::system::error_code, value_type)>(
-            AsyncInit{ *this }, token
+            AsyncInit{ *this }, token, std::forward<DefValueGen>(defvalueGen), 0
             );
 #else
         boost::asio::async_completion<
@@ -255,14 +238,15 @@ public:
     /**
      * @param success - ссылка, по которой записывается флаг успешности операции.
      */
-    value_type tryPop(bool& success)
+    template <typename DefValueGen = ValueFactory<value_type>>
+    value_type tryPop(bool& success, DefValueGen&& defValueGen = DefValueGen{})
     {
         LockGuard lkGuard{ *this };
 
         if (!doPendingPush() && !readyPop())
         {
             success = false;
-            return m_nullValueGen();
+            return std::forward<DefValueGen>(defValueGen)(QueueError::QUEUE_EMPTY);
         }
 
         value_type result = std::move(m_queue.front());
@@ -275,10 +259,11 @@ public:
     /// Пытается синхронно извлечь элемент.
     /// Возвращает элемент при успехе.
     /// Возвращает Elem{}, когда возможно только асинхронное извлечение с ожиданием.
-    value_type tryPop()
+    template <typename DefValueGen = ValueFactory<value_type>>
+    value_type tryPop(DefValueGen&& defValueGen = DefValueGen{})
     {
         bool ignoreSuccess = false;
-        return tryPop(ignoreSuccess);
+        return tryPop(ignoreSuccess, std::forward<DefValueGen>(defValueGen));
     }
 
     /// Возвращает executor, ассоциированный с объектом.
@@ -401,7 +386,6 @@ private:
         , m_pendingOps{ std::move(other.m_pendingOps) }
         , m_pendingOpsIsPushers{ other.m_pendingOpsIsPushers }
         , m_isOpen{ other.m_isOpen }
-        , m_nullValueGen{ std::move(other.m_nullValueGen) }
     {
     }
 
@@ -462,8 +446,8 @@ private:
     }
 
     // Инициатор извлечения.
-    template <typename PopHandler>
-    void initPop(PopHandler&& handler)
+    template <typename PopHandler, typename DefValueGen>
+    void initPop(PopHandler&& handler, DefValueGen&& defvalueGen)
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
@@ -486,9 +470,13 @@ private:
 
         // Извлекать нечего, откладываем при открытой очереди или завершаем с ошибкой при закрытой.
         if (m_isOpen)
-            deferPop(std::forward<PopHandler>(handler));
+            deferPop(std::forward<PopHandler>(handler), std::forward<DefValueGen>(defvalueGen));
         else
-            completePop(std::forward<PopHandler>(handler), QueueError::QUEUE_CLOSED, m_nullValueGen());
+            completePop(
+                  std::forward<PopHandler>(handler)
+                , QueueError::QUEUE_CLOSED
+                , std::forward<DefValueGen>(defvalueGen)(QueueError::QUEUE_CLOSED)
+                );
     }
 
     // Комплитер вставки.
@@ -526,7 +514,7 @@ private:
                   0
                 , std::move(handlerCopy)
                 , ec
-                , std::move(val)
+                , std::forward<U>(val)
                 };
 
         // Сообщаем о завершении извлечения обязательно через post,
@@ -595,8 +583,8 @@ private:
         assert(!hasPendingPop() && hasPendingPush());
     }
 
-    template <typename PopHandler>
-    void deferPop(PopHandler&& handler)
+    template <typename PopHandler, typename DefValueGen>
+    void deferPop(PopHandler&& handler, DefValueGen&& defValueGen)
     {
         assert(!hasPendingPush());
 
@@ -604,14 +592,18 @@ private:
         // пока отложенная операция не будет выполнена.
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
-        auto work = boost::asio::make_work_guard(m_ex);
+        auto capture = detail::makeCompressedPair(
+              std::forward<DefValueGen>(defValueGen)
+            , boost::asio::make_work_guard(m_ex)
+            );
 
         m_pendingOps.push(detail::bindAssociated(
-            [work{ std::move(work) }]
+            [capture{ std::move(capture) }]
             (PopHandler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
+                DefValueGen& defValueGen = capture.getEmpty();
                 if (ec)
-                    self.completePop(std::move(h), ec, self.m_nullValueGen());
+                    self.completePop(std::move(h), ec, std::move(defValueGen)(ec));
                 else
                     self.doAsyncPop(std::move(h));
             }
@@ -682,7 +674,6 @@ private:
     // Флажок, который указывает, что именно хранится в очереди: отложенные вставки или извлечения.
     bool m_pendingOpsIsPushers = false;
     bool m_isOpen = true;
-    NullValueGenerator m_nullValueGen;
 };
 
 
@@ -692,14 +683,12 @@ template <
       typename Elem
     , typename Executor
     , typename HandlerDefaultAllocator
-    , typename NullValueGenerator
     , typename Container
     >
 class Queue<
       Elem
     , Executor
     , HandlerDefaultAllocator
-    , NullValueGenerator
     , Container
     >::LockGuard
 {
@@ -728,14 +717,12 @@ template <
       typename Elem
     , typename Executor
     , typename HandlerDefaultAllocator
-    , typename NullValueGenerator
     , typename Container
     >
 class Queue<
       Elem
     , Executor
     , HandlerDefaultAllocator
-    , NullValueGenerator
     , Container
     >::AsyncInit
 {
@@ -756,7 +743,7 @@ public:
     }
 
     // Чтобы не копипастить AsyncInit отдельно для push и pop, в одном классе перегрузим 2 operator(),
-    // благо они отличаются по количеству аргументов.
+    // для отличия сигнатур для pop добавлен фиктивный аргумент int.
 
     template <typename PushHandler, typename U>
     void operator()(PushHandler&& handler, U&& val) const
@@ -764,10 +751,10 @@ public:
         m_self.initPush(std::forward<U>(val), std::forward<PushHandler>(handler));
     }
 
-    template <typename PopHandler>
-    void operator()(PopHandler&& handler) const
+    template <typename PopHandler, typename DefValueGen>
+    void operator()(PopHandler&& handler, DefValueGen&& defvalueGen, int) const
     {
-        m_self.initPop(std::forward<PopHandler>(handler));
+        m_self.initPop(std::forward<PopHandler>(handler), std::forward<DefValueGen>(defvalueGen));
     }
 
 private:

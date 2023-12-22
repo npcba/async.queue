@@ -197,8 +197,8 @@ public:
      * При отмене ожидаемой операции error == QueueError::OPERATION_CANCELLED и value == Elem{}.
      * При закрытой и пустой очереди error == QueueError::QUEUE_CLOSED и value == Elem{}.
      */
-    template <typename PopToken, typename DefValueGen = ValueFactory<value_type>>
-    auto asyncPop(PopToken&& token, DefValueGen&& defvalueGen = DefValueGen{})
+    template <typename PopToken, typename F = ValueFactory<value_type>>
+    auto asyncPop(PopToken&& token, F&& defValueFactory = F{})
     {
         // Важно: захват мьютекса в этом методе делать нельзя,
         // Вконце asio::async_initiate или init.result.get() происходит суспенд корутины
@@ -206,15 +206,15 @@ public:
         // Вместо этого мьютекс лочится в initPop.
 
 #if BOOST_VERSION >= 107000
-        auto initiate = [this](auto&& handler, auto&& defvalueGen) {
+        auto initiate = [this](auto&& handler, auto&& defValueFactory) {
             initPop(
                   std::forward<decltype(handler)>(handler)
-                , std::forward<decltype(defvalueGen)>(defvalueGen)
+                , std::forward<decltype(defValueFactory)>(defValueFactory)
                 );
         };
 
         return boost::asio::async_initiate<PopToken, void(boost::system::error_code, value_type)>(
-            std::move(initiate), token, std::forward<DefValueGen>(defvalueGen)
+            std::move(initiate), token, std::forward<F>(defValueFactory)
             );
 #else
         boost::asio::async_completion<
@@ -222,7 +222,7 @@ public:
             , void(boost::system::error_code, value_type)
             > init{ token };
 
-        initPop(init.completion_handler, std::forward<DefValueGen>(defvalueGen));
+        initPop(init.completion_handler, std::forward<F>(defValueFactory));
         return init.result.get();
 #endif
     }
@@ -252,15 +252,15 @@ public:
     /**
      * @param success - ссылка, по которой записывается флаг успешности операции.
      */
-    template <typename DefValueGen = ValueFactory<value_type>>
-    value_type tryPop(bool& success, DefValueGen&& defValueGen = DefValueGen{})
+    template <typename F = ValueFactory<value_type>>
+    value_type tryPop(bool& success, F&& defValueFactory = F{})
     {
         LockGuard lkGuard{ *this };
 
         if (!doPendingPush() && !readyPop())
         {
             success = false;
-            return std::forward<DefValueGen>(defValueGen)(QueueError::QUEUE_EMPTY);
+            return std::forward<F>(defValueFactory)(QueueError::QUEUE_EMPTY);
         }
 
         value_type result = std::move(m_queue.front());
@@ -273,11 +273,11 @@ public:
     /// Пытается синхронно извлечь элемент.
     /// Возвращает элемент при успехе.
     /// Возвращает Elem{}, когда возможно только асинхронное извлечение с ожиданием.
-    template <typename DefValueGen = ValueFactory<value_type>>
-    value_type tryPop(DefValueGen&& defValueGen = DefValueGen{})
+    template <typename F = ValueFactory<value_type>>
+    value_type tryPop(F&& defValueFactory = F{})
     {
         bool ignoreSuccess = false;
-        return tryPop(ignoreSuccess, std::forward<DefValueGen>(defValueGen));
+        return tryPop(ignoreSuccess, std::forward<F>(defValueFactory));
     }
 
     /// Возвращает executor, ассоциированный с объектом.
@@ -456,8 +456,8 @@ private:
     }
 
     // Инициатор извлечения.
-    template <typename PopHandler, typename DefValueGen>
-    void initPop(PopHandler&& handler, DefValueGen&& defvalueGen)
+    template <typename PopHandler, typename F>
+    void initPop(PopHandler&& handler, F&& defValueFactory)
     {
         // Чтобы пользователь получил вменяемую ошибку вместо портянки при ошибке в типе хендлера.
         static_assert(
@@ -480,12 +480,12 @@ private:
 
         // Извлекать нечего, откладываем при открытой очереди или завершаем с ошибкой при закрытой.
         if (m_isOpen)
-            deferPop(std::forward<PopHandler>(handler), std::forward<DefValueGen>(defvalueGen));
+            deferPop(std::forward<PopHandler>(handler), std::forward<F>(defValueFactory));
         else
             completePop(
                   std::forward<PopHandler>(handler)
                 , QueueError::QUEUE_CLOSED
-                , std::forward<DefValueGen>(defvalueGen)(QueueError::QUEUE_CLOSED)
+                , std::forward<F>(defValueFactory)(QueueError::QUEUE_CLOSED)
                 );
     }
 
@@ -593,8 +593,8 @@ private:
         assert(!hasPendingPop() && hasPendingPush());
     }
 
-    template <typename PopHandler, typename DefValueGen>
-    void deferPop(PopHandler&& handler, DefValueGen&& defValueGen)
+    template <typename PopHandler, typename F>
+    void deferPop(PopHandler&& handler, F&& defValueFactory)
     {
         assert(!hasPendingPush());
 
@@ -603,7 +603,7 @@ private:
         // В этот момент в очереди asio executor может быть и пусто,
         // но по логике Queue имеет отложенную операцию, до исполнения которой run должен крутиться.
         auto capture = detail::makeCompressedPair(
-              std::forward<DefValueGen>(defValueGen)
+              std::forward<F>(defValueFactory)
             , boost::asio::make_work_guard(m_ex)
             );
 
@@ -611,9 +611,9 @@ private:
             [capture{ std::move(capture) }]
             (PopHandler& h, Queue& self, const boost::system::error_code& ec) mutable
             {
-                DefValueGen& defValueGen = capture.getEmpty();
+                F& defValueFactory = capture.getEmpty();
                 if (ec)
-                    self.completePop(std::move(h), ec, std::move(defValueGen)(ec));
+                    self.completePop(std::move(h), ec, std::move(defValueFactory)(ec));
                 else
                     self.doAsyncPop(std::move(h));
             }

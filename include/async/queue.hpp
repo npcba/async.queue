@@ -752,10 +752,10 @@ public:
         m_self.initPush(std::forward<U>(val), std::forward<PushHandler>(handler));
     }
 
-    template <typename PopHandler, typename DefValueGen>
-    void operator()(PopHandler&& handler, DefValueGen&& defvalueGen, int) const
+    template <typename PopHandler, typename F>
+    void operator()(PopHandler&& handler, F&& defValueFactory, int) const
     {
-        m_self.initPop(std::forward<PopHandler>(handler), std::forward<DefValueGen>(defvalueGen));
+        m_self.initPop(std::forward<PopHandler>(handler), std::forward<F>(defValueFactory));
     }
 
 private:

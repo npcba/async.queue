@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cassert>
 #include <type_traits>
+
 #include <boost/system/error_code.hpp>
 
 
@@ -11,7 +13,8 @@ enum class QueueError : int
 {
     OK = 0,
     OPERATION_CANCELLED,
-    QUEUE_CLOSED
+    QUEUE_CLOSED,
+    QUEUE_EMPTY
 };
 
 namespace detail {
@@ -34,6 +37,8 @@ namespace detail {
                 return "Queue operation cancelled";
             case QueueError::QUEUE_CLOSED:
                 return "Queue closed";
+            case QueueError::QUEUE_EMPTY:
+                return "Queue empty";
             default:
                 assert(!"Unexpected QueueError value");
                 return "Unknown QueueError error";

@@ -106,6 +106,14 @@ private:
 };
 #endif // __cplusplus < 202002L // C++20
 
+
+template <typename Empty, typename Solid>
+CompressedPair<std::decay_t<Empty>, std::decay_t<Solid>>
+makeCompressedPair(Empty&& empty, Solid&& solid)
+{
+    return { std::forward<Empty>(empty), std::forward<Solid>(solid) };
+}
+
 } // namespace detail
 } // namespace async
 } // namespace ba

@@ -47,9 +47,9 @@ BOOST_AUTO_TEST_CASE(strandTest)
         BOOST_CHECK(s1.running_in_this_thread());
         }));
 
-    q0.asyncPop(boost::asio::bind_executor(s1, [s1](boost::system::error_code, ba::async::Optional<int> val) {
+    q0.asyncPop(boost::asio::bind_executor(s1, [s1](boost::system::error_code, int val) {
         BOOST_CHECK(s1.running_in_this_thread());
-        BOOST_CHECK(123 == *val);
+        BOOST_CHECK(123 == val);
         }));
 
     ThreadPool{ ioc, 10 }.join();
@@ -58,9 +58,9 @@ BOOST_AUTO_TEST_CASE(strandTest)
         BOOST_CHECK(s2.running_in_this_thread());
         }));
 
-    q0.asyncPop(s2.wrap([s2](boost::system::error_code, ba::async::Optional<int> val) {
+    q0.asyncPop(s2.wrap([s2](boost::system::error_code, int val) {
         BOOST_CHECK(s2.running_in_this_thread());
-        BOOST_CHECK(123 == *val);
+        BOOST_CHECK(123 == val);
         }));
 
     ioc.restart();
@@ -68,9 +68,9 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q1{ s1, 10 };
 
-    q1.asyncPop([s1](boost::system::error_code, ba::async::Optional<int> val) {
+    q1.asyncPop([s1](boost::system::error_code, int val) {
         BOOST_CHECK(s1.running_in_this_thread());
-        BOOST_CHECK(123 == *val);
+        BOOST_CHECK(123 == val);
         });
 
     q1.asyncPush(123, [s1](boost::system::error_code) {
@@ -82,9 +82,9 @@ BOOST_AUTO_TEST_CASE(strandTest)
 
     ba::async::Queue<int> q2{ s2, 10 };
 
-    q2.asyncPop([s2](boost::system::error_code, ba::async::Optional<int> val) {
+    q2.asyncPop([s2](boost::system::error_code, int val) {
         BOOST_CHECK(s2.running_in_this_thread());
-        BOOST_CHECK(123 == *val);
+        BOOST_CHECK(123 == val);
         });
 
     q2.asyncPush(123, [s2](boost::system::error_code) {
@@ -110,18 +110,18 @@ BOOST_AUTO_TEST_CASE(futureTest)
     boost::asio::io_context ioc;
     ba::async::Queue<int> q{ ioc, 1 };
 
-    std::future<ba::async::Optional<int>> fPop = q.asyncPop(boost::asio::use_future);
+    std::future<int> fPop = q.asyncPop(boost::asio::use_future);
     std::future<void> fPush = q.asyncPush(123, boost::asio::use_future);
 
     ThreadPool{ ioc, 10 }.join();
 
     BOOST_CHECK_NO_THROW(fPush.get());
-    BOOST_CHECK_EQUAL(123, *fPop.get());
+    BOOST_CHECK_EQUAL(123, fPop.get());
     BOOST_CHECK(q.empty());
     BOOST_CHECK_EQUAL(0, q.cancel());
 
 
-    std::future<ba::async::Optional<int>> fPopUnderflow = q.asyncPop(boost::asio::use_future);
+    std::future<int> fPopUnderflow = q.asyncPop(boost::asio::use_future);
     BOOST_CHECK_EQUAL(1, q.cancel());
 
     fPush = q.asyncPush(123, boost::asio::use_future);
@@ -157,7 +157,7 @@ BOOST_AUTO_TEST_CASE(contentTest)
         std::size_t sum = 0;
         // Суммируем все извлеченное.
         for (std::size_t i = 1; i <= 10'000; ++i)
-            BOOST_CHECK_NO_THROW(sum += q.asyncPop(yield).value());
+            BOOST_CHECK_NO_THROW(sum += q.asyncPop(yield));
 
         // Проверяем полученную сумму.
         BOOST_CHECK_EQUAL(50005000, sum);
@@ -189,7 +189,7 @@ BOOST_AUTO_TEST_CASE(ManyProducerTest)
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         std::size_t sum = 0;
         for (std::size_t i = 1; i <= 10'000; ++i)
-            BOOST_CHECK_NO_THROW(sum += q.asyncPop(yield).value());
+            BOOST_CHECK_NO_THROW(sum += q.asyncPop(yield));
 
         BOOST_CHECK_EQUAL(5005000, sum);
     });
@@ -219,7 +219,7 @@ BOOST_AUTO_TEST_CASE(manyConsumerTest)
     {
         boost::asio::spawn(ioc, [&q, &sum](boost::asio::yield_context yield) {
             for (std::size_t i = 1; i <= 1'000; ++i)
-                sum += q.asyncPop(yield).value();
+                sum += q.asyncPop(yield);
         });
     }
 
@@ -248,24 +248,24 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
     ba::async::Queue<Movable> q{ ioc, 10 };
 
     q.asyncPush(Movable{}, [](boost::system::error_code) {});
-    q.asyncPop([](boost::system::error_code, ba::async::Optional<Movable>) {});
+    q.asyncPop([](boost::system::error_code, Movable) {});
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
         q.asyncPush(Movable{}, yield);
     });
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
-        Movable m = std::move(q.asyncPop(yield).value());
+        Movable m = std::move(q.asyncPop(yield));
         std::ignore = m;
     });
 
     std::future<void> fPush = q.asyncPush(Movable{}, boost::asio::use_future);
-    std::future<ba::async::Optional<Movable>> fPop = q.asyncPop(boost::asio::use_future);
+    std::future<Movable> fPop = q.asyncPop(boost::asio::use_future);
 
     ThreadPool{ ioc, 4 }.join();
 
     fPush.get();
-    ba::async::Optional<Movable> val = fPop.get();
+    Movable val = fPop.get();
 }
 
 #if BOOST_VERSION >= 107000
@@ -284,7 +284,6 @@ BOOST_AUTO_TEST_CASE(moveHandlerTest)
 
         void operator()(boost::system::error_code) const {}
         void operator()(boost::system::error_code, int) const {}
-        void operator()(boost::system::error_code, ba::async::NullOptT) const {}
     };
 
     boost::asio::io_context ioc;
@@ -317,11 +316,11 @@ BOOST_AUTO_TEST_CASE(moveQueueTest)
     q1.asyncPush(4, [](boost::system::error_code) {});
     q1.asyncPush(5, [](boost::system::error_code) {});
 
-    q1.asyncPop([&q1, &q2](boost::system::error_code, ba::async::Optional<int>) mutable {
+    q1.asyncPop([&q1, &q2](boost::system::error_code, int) mutable {
         q2 = std::move(q1);
     });
 
-    q1.asyncPop([&q2, &q3](boost::system::error_code, ba::async::Optional<int>) mutable {
+    q1.asyncPop([&q2, &q3](boost::system::error_code, int) mutable {
         // Делаем именно в хендлере, что бы поймать состояние полной очереди и ожидающей операции вставки.
         // После ThreadPool::join нельзя, он зависнет на ожидающей операции вставки.
 
@@ -403,7 +402,7 @@ BOOST_AUTO_TEST_CASE(allocatorTest)
         {
         }
 
-        void operator()(boost::system::error_code, ba::async::Optional<int>)
+        void operator()(boost::system::error_code, int)
         {
         }
     };
@@ -442,7 +441,7 @@ BOOST_AUTO_TEST_CASE(cpp20CoroTest)
         std::size_t sum = 0;
         // Суммируем все извлеченное.
         for (std::size_t i = 1; i <= 10'000; ++i)
-            BOOST_CHECK_NO_THROW(sum += (co_await q.asyncPop(boost::asio::use_awaitable)).value());
+            BOOST_CHECK_NO_THROW(sum += (co_await q.asyncPop(boost::asio::use_awaitable)));
 
         // Проверяем полученную сумму.
         BOOST_CHECK_EQUAL(50005000, sum);

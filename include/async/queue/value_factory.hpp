@@ -24,7 +24,7 @@ public:
         return construct(m_args, std::make_index_sequence<sizeof...(Args)>{});
     }
 
-    T operator()(const boost::system::error_code& ec)
+    T operator()(const boost::system::error_code&)
     {
         return construct(m_args, std::make_index_sequence<sizeof...(Args)>{});
     }

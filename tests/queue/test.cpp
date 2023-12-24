@@ -266,6 +266,7 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
 
     fPush.get();
     Movable val = fPop.get();
+    std::ignore = val;
 }
 
 #if BOOST_VERSION >= 107000

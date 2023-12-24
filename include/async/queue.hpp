@@ -497,14 +497,14 @@ private:
     void completePop(PopHandler&& handler, const boost::system::error_code& ec, U&& val)
     {
         // move_binder2 не умеет форвардить handler, только перемещает.
-        // Копируем, если lvalue-ссылка, иначе форвардим на перемещение (rvalue).
-        using CopyIfLValueRef = std::conditional_t<
-              std::is_lvalue_reference<PopHandler>::value
+        // Копируем, если lvalue-ссылка || const rvalue-ссылка, иначе форвардим на перемещение (rvalue).
+        using CopyIfNotMovable = std::conditional_t<
+              std::is_lvalue_reference<PopHandler>::value || std::is_const<PopHandler>::value
             , std::decay_t<PopHandler>
-            , PopHandler
+            , PopHandler&&
             >;
 
-        CopyIfLValueRef handlerCopy = std::forward<PopHandler>(handler);
+        CopyIfNotMovable h = std::forward<PopHandler>(handler);
 
         // move_binder2 вместо обычного, чтобы не копировать лишний раз val
         boost::asio::detail::move_binder2<
@@ -513,7 +513,7 @@ private:
             , U
             > binder{
                   0
-                , std::move(handlerCopy)
+                , std::move(h)
                 , ec
                 , std::forward<U>(val)
                 };
@@ -600,7 +600,7 @@ private:
 
         m_pendingOps.push(detail::bindAssociated(
             [capture{ std::move(capture) }]
-            (PopHandler& h, Queue& self, const boost::system::error_code& ec) mutable
+            (std::decay_t<PopHandler>& h, Queue& self, const boost::system::error_code& ec) mutable
             {
                 F& defValueFactory = capture.getEmpty();
                 if (ec)

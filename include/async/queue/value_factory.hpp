@@ -39,6 +39,18 @@ private:
     std::tuple<Args...> m_args;
 };
 
+// Специализация для конструирования без аргументов,
+// чтобы не хранить пустой std::tuple, который делает класс ValueFactory непустым.
+template <typename T>
+class ValueFactory<T>
+{
+public:
+    T operator()(const boost::system::error_code&) const
+    {
+        return T{};
+    }
+};
+
 
 template <typename T, typename... Args>
 ValueFactory<T, std::decay_t<Args>...> makeValueFactory(Args&&... args)

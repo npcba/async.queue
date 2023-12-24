@@ -18,7 +18,6 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/post.hpp>
 
-
 // Библиотека использует недокументированный boost::asio::detail::binder и move_binder
 // Они широко используется во внутренностях asio, и, вероятно, его поддержка не иссякнет.
 // Предпочтительнее использовать его, т.к. его поддерживают и могут добавить для него новые traits.
@@ -120,7 +119,7 @@ public:
         m_queue = std::move(other.m_queue);
         m_pendingOps = std::move(other.m_pendingOps);
         m_pendingOpsIsPushers = other.m_pendingOpsIsPushers;
-        m_isOpen = other.m_isOpen;
+        m_closeState = other.m_closeState;
         checkInvariant();
 
         // other нужно очистить на случай,
@@ -224,7 +223,7 @@ public:
     bool tryPush(U&& val)
     {
         LockGuard lkGuard{ *this };
-        if (!readyPush() || !m_isOpen)
+        if (!readyPush() || m_closeState)
             return false;
 
         doPush(std::forward<U>(val));
@@ -350,25 +349,37 @@ public:
         // У std::queue не clear :)
         m_queue = container_type{};
         doCancel(QueueError::OPERATION_CANCELLED);
-        m_isOpen = true;
+        m_closeState.clear();
     }
 
     /// Закрывает очередь для последующей вставки, отменяет все отложенные операции.
     /// Извлечение будет успешно вплоть до опустошения очереди, дальнейшее извлечение приведет к ошибке.
-    void close()
+    /// Если передали пустой код ошибки, то возвращает false и ничего не делает, иначе true.
+    bool close(const boost::system::error_code& ec = QueueError::QUEUE_CLOSED)
     {
+        // Закрываем только с кодом ошибки.
+        if (!ec)
+            return;
+
         LockGuard lkGuard{ *this };
-        m_isOpen = false;
-        doCancel(QueueError::QUEUE_CLOSED);
+        m_closeState = ec;
+        doCancel(m_closeState);
     }
 
-    /// Показывает открыта ли очередь.
-    /// После создания очереди или после вызова reset возвращает true.
-    /// После вызова close возвращает false.
-    bool isOpen()
+    /// Возвращает код ошибки, с которым была закрыта очередь.
+    /// После создания очереди или после вызова reset возвращает пустой код.
+    /// После вызова close(ec) возвращает ec.
+    boost::system::error_code closeState() const
     {
         LockGuard lkGuard{ *this };
-        return m_isOpen;
+        return m_closeState;
+    }
+
+    /// Возвращает !closeState().
+    bool isOpen() const
+    {
+        LockGuard lkGuard{ *this };
+        return !m_closeState;
     }
 
 private:
@@ -386,7 +397,7 @@ private:
         , m_queue{ std::move(other.m_queue) }
         , m_pendingOps{ std::move(other.m_pendingOps) }
         , m_pendingOpsIsPushers{ other.m_pendingOpsIsPushers }
-        , m_isOpen{ other.m_isOpen }
+        , m_closeState{ other.m_closeState }
     {
     }
 
@@ -429,9 +440,9 @@ private:
         LockGuard lkGuard{ *this };
 
         // Если очередь закрыта, завершаем с ошибкой, в закрытую очередь не вставляем.
-        if (!m_isOpen)
+        if (m_closeState)
         {
-            completePush(std::forward<PushHandler>(handler), QueueError::QUEUE_CLOSED);
+            completePush(std::forward<PushHandler>(handler), m_closeState);
             return;
         }
 
@@ -470,13 +481,13 @@ private:
         }
 
         // Извлекать нечего, откладываем при открытой очереди или завершаем с ошибкой при закрытой.
-        if (m_isOpen)
+        if (!m_closeState)
             deferPop(std::forward<PopHandler>(handler), std::forward<F>(defValueFactory));
         else
             completePop(
                   std::forward<PopHandler>(handler)
-                , QueueError::QUEUE_CLOSED
-                , std::forward<F>(defValueFactory)(QueueError::QUEUE_CLOSED)
+                , m_closeState
+                , std::forward<F>(defValueFactory)(m_closeState)
                 );
     }
 
@@ -656,7 +667,7 @@ private:
         assert(m_queue.size() <= m_limit);
         assert(m_queue.size() == m_limit || !hasPendingPush());
         assert(m_queue.empty() || !hasPendingPop());
-        assert(m_isOpen || m_pendingOps.empty());
+        assert(!m_closeState || m_pendingOps.empty());
     }
 
 private:
@@ -674,7 +685,7 @@ private:
 
     // Флажок, который указывает, что именно хранится в очереди: отложенные вставки или извлечения.
     bool m_pendingOpsIsPushers = false;
-    bool m_isOpen = true;
+    boost::system::error_code m_closeState;
 };
 
 

@@ -346,7 +346,7 @@ public:
     {
         LockGuard lkGuard{ *this };
 
-        // У std::queue не clear :)
+        // У std::queue нет clear :)
         m_queue = container_type{};
         doCancel(QueueError::OPERATION_CANCELLED);
         m_closeState.clear();

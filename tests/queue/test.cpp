@@ -255,7 +255,7 @@ BOOST_AUTO_TEST_CASE(moveValueTest)
     });
 
     boost::asio::spawn(ioc, [&q](boost::asio::yield_context yield) {
-        Movable m = std::move(q.asyncPop(yield));
+        Movable m = q.asyncPop(yield);
         std::ignore = m;
     });
 

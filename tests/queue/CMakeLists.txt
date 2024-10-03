@@ -1,5 +1,5 @@
 enable_testing()
-project(queue_test)
+project(queue.test)
 
 if (MSVC)
     add_compile_options(/bigobj)

@@ -190,7 +190,7 @@ protected:
 // Хранитель реального типа функции, вставляемой в список.
 template <typename... Args, typename DefaultAllocator>
 template <typename F>
-class FunctionQueue<void(Args...), DefaultAllocator>::Holder
+class FunctionQueue<void(Args...), DefaultAllocator>::Holder final
     : public Node
 {
 public:
